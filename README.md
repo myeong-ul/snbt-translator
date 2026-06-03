@@ -82,7 +82,6 @@ Premium engines (Papago, ChatGPT) will automatically prompt you for keys on firs
 ```text
 deep-translator
 python-dotenv
-
 ```
 
 ---
