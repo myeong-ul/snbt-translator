@@ -1,0 +1,5 @@
+.venv
+.idea
+test_key.env
+en_us.snbt
+ko_kr.snbt

@@ -1,7 +1,27 @@
 import os
 import re
 import sys
-from deep_translator import GoogleTranslator
+from dotenv import load_dotenv, set_key
+from deep_translator import GoogleTranslator, PapagoTranslator, ChatGptTranslator
+
+# .env 파일 경로 지정
+ENV_FILE = "api.env"
+
+
+def load_or_request_api_key(key_name, provider_name):
+    """env 파일에서 키를 읽어오고, 없으면 입력받아 env 파일에 저장합니다."""
+    load_dotenv(ENV_FILE)
+    api_key = os.getenv(key_name)
+
+    if not api_key:
+        print(f"\n[안내] {provider_name} API 키가 {ENV_FILE} 파일에 존재하지 않습니다.")
+        api_key = input(f"➔ {provider_name} API 키를 입력해주세요: ").strip()
+
+        # 입력받은 키를 api.env 파일에 자동 생성/저장
+        set_key(ENV_FILE, key_name, api_key)
+        print(f"➔ {ENV_FILE} 파일에 키가 성공적으로 저장되었습니다.\n")
+
+    return api_key
 
 
 def protect_color_codes(text):
@@ -11,7 +31,6 @@ def protect_color_codes(text):
 
 def restore_color_codes(text):
     pattern = re.compile(r'___CLR_([a-zA-Z0-9])___')
-    # 혹시 모를 공백 제거 처리
     text = re.sub(r'___\s*CLR_\s*([a-zA-Z0-9])\s*___', r'&\1', text)
     return pattern.sub(r'&\1', text)
 
@@ -32,37 +51,74 @@ def main():
         print(f"오류: {input_path} 파일이 존재하지 않습니다.")
         return
 
-    print("파일을 읽는 중...")
+    # ----------------------------------------------------
+    # 번역기 선택 메뉴
+    # ----------------------------------------------------
+    print("=" * 40)
+    print(" 사용할 번역기를 선택해 주세요.")
+    print(" 1. Google 번역 (무료 / 안정적)")
+    print(" 2. Naver Papago (API 키 필요)")
+    print(" 3. OpenAI ChatGPT (API 키 및 비용 필요)")
+    print("=" * 40)
+
+    choice = input("선택 (1~3): ").strip()
+
+    translator = None
+    max_batch_chars = 4000  # 번역기별 안정적인 글자수 제한
+
+    if choice == '1':
+        print("\n➔ Google 번역기를 선택하셨습니다.")
+        translator = GoogleTranslator(source='en', target='ko')
+        max_batch_chars = 4000
+
+    elif choice == '2':
+        print("\n➔ Naver Papago를 선택하셨습니다.")
+        client_id = load_or_request_api_key("PAPAGO_CLIENT_ID", "Papago Client ID")
+        client_secret = load_or_request_api_key("PAPAGO_CLIENT_SECRET", "Papago Client Secret")
+
+        # deep_translator의 파파고 객체 생성
+        translator = PapagoTranslator(client_id=client_id, secret_key=client_secret, source='en', target='ko')
+        max_batch_chars = 4000  # 파파고 무료/글로벌 제한은 5,000자
+
+    elif choice == '3':
+        print("\n➔ OpenAI ChatGPT를 선택하셨습니다.")
+        openai_key = load_or_request_api_key("OPENAI_API_KEY", "OpenAI API Secret Key")
+
+        translator = ChatGptTranslator(api_key=openai_key, source='english', target='korean')
+        max_batch_chars = 2500  # ChatGPT는 프롬프트 공간 확보를 위해 조금 더 작게 묶음
+
+    else:
+        print("올바른 번역기를 선택하지 않아 프로그램을 종료합니다.")
+        return
+
+    # ----------------------------------------------------
+    # 파일 읽기 및 문장 추출
+    # ----------------------------------------------------
+    print("\n파일을 읽는 중...")
     with open(input_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # 큰따옴표 안의 문자열 추출
     pattern = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
     matches = pattern.findall(content)
-
-    # 중복 제거를 통해 번역할 유니크한 문장만 추출 (성능 추가 향상)
     unique_matches = list(set(matches))
     print(f"총 문장 수: {len(matches)}개 (중복 제외 유니크 문장: {len(unique_matches)}개)")
 
-    # 1. 문장들을 묶는 작업
+    # ----------------------------------------------------
+    # 글자수 제한에 맞게 문장 묶기 (Batching)
+    # ----------------------------------------------------
     chunks = []
     current_chunk = []
     current_length = 0
-
-    # 각 문장 간의 구분을 위한 특수 구분자
     DELIMITER = "\n[=]\n"
 
     for text in unique_matches:
-        # 번역 제외 대상 처리
         if not text.strip() or text.startswith('{@'):
             continue
 
         protected = protect_color_codes(text)
-        # 구분자를 포함한 예상 길이를 계산
         estimated_len = len(protected) + len(DELIMITER)
 
-        # 안전하게 4000자가 넘어가면 다음 묶음으로 분리
-        if current_length + estimated_len > 4000:
+        if current_length + estimated_len > max_batch_chars:
             chunks.append(current_chunk)
             current_chunk = [protected]
             current_length = len(protected)
@@ -76,28 +132,22 @@ def main():
     total_chunks = len(chunks)
     print(f"➔ 문장들을 {total_chunks}개의 묶음으로 결합했습니다. 번역 시작...\n")
 
-    # 2. 번역기 정의
-    translator = GoogleTranslator(source='en', target='ko')
+    # 예외 대상 문자열 사전 등록
     translated_map = {}
-
-    # 예외/제외 대상 문자열들은 원본 그대로 맵에 미리 등록
     for text in matches:
         if not text.strip() or text.startswith('{@'):
             translated_map[text] = text
 
-    # 3. 묶음 단위로 대량 번역 진행
+    # ----------------------------------------------------
+    # 묶음 번역 진행
+    # ----------------------------------------------------
     for idx, chunk in enumerate(chunks):
-        # 여러 문장을 하나의 거대한 텍스트로 결합
         combined_text = DELIMITER.join(chunk)
 
         try:
-            # 단 한 번의 요청으로 수십 개의 문장을 한 번에 번역
             translated_combined = translator.translate(text=combined_text)
-
-            # 번역된 텍스트를 다시 각 문장으로 분리
             translated_lines = translated_combined.split(DELIMITER)
 
-            # 원본 영어 문장과 번역된 한글 문장을 매핑 딕셔너리에 저장
             for orig_protected, trans_protected in zip(chunk, translated_lines):
                 orig_raw = restore_color_codes(orig_protected)
                 trans_raw = restore_color_codes(trans_protected.strip())
@@ -113,7 +163,7 @@ def main():
 
     print("\n\n모든 묶음 번역 완료! 고속 파일 결합 중...")
 
-    # 4. 정규식 패턴에 매칭되는 부분을 번역된 텍스트로 고속 치환
+    # 치환 및 파일 저장
     final_content = pattern.sub(lambda m: f'"{translated_map.get(m.group(1), m.group(1))}"', content)
 
     with open(output_path, 'w', encoding='utf-8') as f:
