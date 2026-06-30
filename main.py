@@ -10,7 +10,9 @@ from module import (
     decode_text,
     get_translator,
     build_batches,
-    translate_batch
+    translate_batch,
+    scan_and_learn_nouns,
+    scan_and_build_local_glossary
 )
 
 # 전 세계 주요 언어 코드 매핑 딕셔너리 (번호순)
@@ -106,6 +108,9 @@ def main():
     src_lang = select_language("출발(원본) 언어를 선택하세요", "en")
     dest_lang = select_language("도착(목적) 언어를 선택하세요", "ko")
 
+    if dest_lang == "ko_kr" or dest_lang == "ko":
+        scan_and_build_local_glossary()
+
     print("\n" + "-" * 50)
     skip_choice = input("➔ 챕터명 및 챕터 그룹을 번역에서 제외하시겠습니까? (y/n, 기본 y): ").strip().lower()
     skip_chapters = False if skip_choice == 'n' else True
@@ -174,6 +179,10 @@ def main():
             save_translated_file(task['output_path'], content, {}, task['ext'])
             continue
 
+        # [★ 신규 추가] 배치를 묶기 전, 파일 내 명사들을 스캔하여 자동으로 학습합니다.
+        scan_and_learn_nouns(unique_matches, translator)
+
+        # 2. 배치 조립 (이제 자동으로 확장된 glossary.json을 기반으로 인코딩됨)
         chunks = build_batches(unique_matches, max_batch_chars, encode_text)
         total_chunks = len(chunks)
         print(f"[{task['display_name']}] 총 문장 {len(matches)}개 -> {total_chunks}개 배치 결합 완료.")
