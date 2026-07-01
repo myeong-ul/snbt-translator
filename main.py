@@ -5,20 +5,19 @@ import shutil
 import sys
 import threading
 import time
-# GUI 관련 라이브러리
-import tkinter as tk
 import zipfile
 from datetime import datetime
-from tkinter import ttk, messagebox, filedialog
 
-# [로직 유지] 기존 파일들로부터 환경 설정 변수 및 핵심 함수 로드
+# HTML GUI 브릿지 라이브러리
+import webview
+
+# 기존 모듈 및 설정 변수 로드
 from cli_translator import (
     load_or_setup_launcher_paths,
     find_modpacks_deep,
     parse_target_localization_files,
     get_final_lang_code,
-    CONFIG_FILE,
-    LANG_MENU
+    CONFIG_FILE
 )
 
 try:
@@ -32,498 +31,207 @@ try:
         translate_batch,
         scan_and_build_local_glossary
     )
-    # api.env 수정을 위해 translator_core의 ENV_FILE 참조 가능 여부 확인 후 설정
     from module.translator_core import ENV_FILE
 except ImportError as e:
     print(f"❌ [오류] 'module' 패키지를 로드할 수 없습니다: {e}")
     sys.exit(1)
 
 
-class MinecraftTranslatorGUI(tk.Tk):
+class WebGUIBridge:
+    """HTML/JS(프론트엔드)와 Python(백엔드) 간의 실시간 데이터 연동을 담당하는 브릿지 클래스"""
+
     def __init__(self):
-        super().__init__()
-        self.title("Minecraft Modpack High-Speed Translator (GUI)")
-        self.geometry("850x850")
-        self.minimum_size = (800, 750)
-
-        self.modpacks_data = []
-        self.selected_pack_info = None
-
-        # 설정 통합 관리 (경로 + 엔진별 API 설정)
+        self.window = None
         self.config_data = {}
+        self.modpacks_data = []
 
-        self.setup_styles()
-        self.create_widgets()
+    def log_to_html(self, message):
+        """웹 UI 콘솔창으로 메시지 실시간 전송"""
+        if self.window:
+            # 자바스크립트의 안전한 이스케이프 처리를 위해 json.dumps 사용
+            safe_msg = json.dumps(message)
+            self.window.evaluate_js(f"appendLog({safe_msg});")
 
-        # 저장된 설정 로드 및 UI 초기화
-        self.init_config_and_scan()
+    def update_status_to_html(self, text, pct=0):
+        """웹 UI 하단 상태바 및 프로그레스바 동기화"""
+        if self.window:
+            safe_text = json.dumps(text)
+            self.window.evaluate_js(f"updateStatus({safe_text}, {pct});")
 
-    def setup_styles(self):
-        self.style = ttk.Style()
-        self.style.theme_use("clam")
-
-        self.style.configure(".", font=("Malgun Gothic", 10))
-        self.style.configure("TLabelframe", padding=10)
-        self.style.configure("TLabelframe.Label", font=("Malgun Gothic", 11, "bold"), foreground="#2c3e50")
-        self.style.configure("TButton", font=("Malgun Gothic", 10, "bold"), padding=4)
-
-        # 하단 번역 시작 버튼 전용 강조 스타일 (Blue Accent)
-        self.style.configure("Action.TButton", font=("Malgun Gothic", 12, "bold"), background="#3498db",
-                             foreground="white")
-        self.style.map("Action.TButton", background=[("active", "#2980b9")])
-
-    def create_widgets(self):
-        main_container = ttk.Frame(self, padding=10)
-        main_container.pack(fill="both", expand=True)
-
-        # ==========================================
-        # 상단 영역: 1. 번역기 엔진 & 2. 옵션 및 언어 설정
-        # ==========================================
-        top_frame = ttk.Frame(main_container)
-        top_frame.pack(fill="x", side="top", pady=(0, 5))
-
-        # 1. 번역기 엔진 선택 (좌측) - 최초 선택은 구글(1)
-        self.engine_lf = ttk.LabelFrame(top_frame, text=" 1. 번역기 엔진 선택 ")
-        self.engine_lf.pack(fill="both", expand=True, side="left", padx=(0, 5))
-
-        self.engine_var = tk.StringVar(value="1")  # 최초 기본값 구글(1)
-        engines = [
-            ("Google (무료)", "1"), ("Papago", "2"),
-            ("ChatGPT", "3"), ("나만의 로컬 NLLB", "4"), ("Gemini (추천)", "5")
-        ]
-        for text, val in engines:
-            rb = ttk.Radiobutton(
-                self.engine_lf, text=text, value=val, variable=self.engine_var,
-                command=self.on_engine_change  # 엔진 바뀔 때마다 입력 필드 토글
-            )
-            rb.pack(anchor="w", pady=3, padx=5)
-
-        # 2. 언어 및 작업 옵션 (우측)
-        opt_lf = ttk.LabelFrame(top_frame, text=" 2. 언어 및 작업 옵션 ")
-        opt_lf.pack(fill="both", expand=True, side="right", padx=(5, 0))
-
-        form_frame = ttk.Frame(opt_lf)
-        form_frame.pack(fill="x", anchor="n", pady=5)
-
-        lang_options = [f"{v[0]} ({v[1]})" for v in LANG_MENU.values()]
-
-        ttk.Label(form_frame, text="출발 언어 선택:").grid(row=0, column=0, sticky="w", pady=5, padx=5)
-        self.src_lang_combo = ttk.Combobox(form_frame, values=lang_options, width=18, state="readonly")
-        self.src_lang_combo.set("영어 (en)")
-        self.src_lang_combo.grid(row=0, column=1, sticky="w", pady=5, padx=5)
-
-        ttk.Label(form_frame, text="도착 언어 선택:").grid(row=1, column=0, sticky="w", pady=5, padx=5)
-        self.dest_lang_combo = ttk.Combobox(form_frame, values=lang_options, width=18, state="readonly")
-        self.dest_lang_combo.set("한국어 (ko)")
-        self.dest_lang_combo.grid(row=1, column=1, sticky="w", pady=5, padx=5)
-
-        self.skip_chapters_var = tk.BooleanVar(value=True)
-        cb_skip = ttk.Checkbutton(opt_lf, text="퀘스트 챕터명 및 그룹 번역 제외 (추천)", variable=self.skip_chapters_var)
-        cb_skip.pack(anchor="w", pady=8, padx=5)
-
-        # ==========================================
-        # 📌 [새로운 영역] 엔진별 가변/동적 API 입력 프레임
-        # ==========================================
-        self.dynamic_api_lf = ttk.LabelFrame(main_container, text=" 번역기 상세 인증 설정 ")
-        self.dynamic_api_lf.pack(fill="x", pady=5)
-
-        # 내부 제어용 컴포넌트 변수 바인딩
-        self.api_key_var = tk.StringVar()
-        self.model_name_var = tk.StringVar()
-        self.endpoint_url_var = tk.StringVar()
-
-        # 대용량 내부 컨테이너 생성 (지웠다 그리며 동적 전환)
-        self.api_content_frame = ttk.Frame(self.dynamic_api_lf)
-        self.api_content_frame.pack(fill="x", expand=True)
-
-        # ==========================================
-        # 중간 영역 1: 런처 탐색 경로 설정
-        # ==========================================
-        path_lf = ttk.LabelFrame(main_container, text=" 런처 인스턴스 탐색 경로 설정 (수정 시 자동 저장) ")
-        path_lf.pack(fill="x", pady=5)
-
-        cf_frame = ttk.Frame(path_lf)
-        cf_frame.pack(fill="x", pady=2)
-        ttk.Label(cf_frame, text="CurseForge:", width=13, anchor="e").pack(side="left", padx=5)
-        self.cf_path_var = tk.StringVar()
-        ttk.Entry(cf_frame, textvariable=self.cf_path_var).pack(side="left", fill="x", expand=True, padx=5)
-        ttk.Button(cf_frame, text="변경", width=5,
-                   command=lambda: self.browse_launcher_path("CurseForge", self.cf_path_var)).pack(side="right", padx=5)
-
-        pm_frame = ttk.Frame(path_lf)
-        pm_frame.pack(fill="x", pady=2)
-        ttk.Label(pm_frame, text="Prism:", width=13, anchor="e").pack(side="left", padx=5)
-        self.pm_path_var = tk.StringVar()
-        ttk.Entry(pm_frame, textvariable=self.pm_path_var).pack(side="left", fill="x", expand=True, padx=5)
-        ttk.Button(pm_frame, text="변경", width=5,
-                   command=lambda: self.browse_launcher_path("Prism Launcher", self.pm_path_var)).pack(side="right",
-                                                                                                       padx=5)
-
-        mr_frame = ttk.Frame(path_lf)
-        mr_frame.pack(fill="x", pady=2)
-        ttk.Label(mr_frame, text="Modrinth:", width=13, anchor="e").pack(side="left", padx=5)
-        self.mr_path_var = tk.StringVar()
-        ttk.Entry(mr_frame, textvariable=self.mr_path_var).pack(side="left", fill="x", expand=True, padx=5)
-        ttk.Button(mr_frame, text="변경", width=5,
-                   command=lambda: self.browse_launcher_path("Modrinth App", self.mr_path_var)).pack(side="right",
-                                                                                                     padx=5)
-
-        # ==========================================
-        # 중간 영역 2: 3. 대상 모드팩 및 인스턴스 선택
-        # ==========================================
-        pack_lf = ttk.LabelFrame(main_container, text=" 3. 대상 모드팩 및 인스턴스 선택 ", padding=5)
-        pack_lf.pack(fill="both", expand=True, pady=5)
-
-        list_frame = ttk.Frame(pack_lf)
-        list_frame.pack(fill="both", expand=True, pady=(0, 5))
-
-        self.pack_listbox = tk.Listbox(
-            list_frame,
-            font=("Consolas" if os.name == 'nt' else "Courier", 10),
-            selectmode="browse", bd=1, relief="solid"
-        )
-        self.pack_listbox.pack(fill="both", expand=True, side="left")
-        self.pack_listbox.bind("<<ListboxSelect>>", self.on_pack_select)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.pack_listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.pack_listbox.config(yscrollcommand=scrollbar.set)
-
-        path_btn_frame = ttk.Frame(pack_lf)
-        path_btn_frame.pack(fill="x", pady=2)
-        ttk.Button(path_btn_frame, text="🔄 런처 재스캔 및 목록 갱신", command=self.scan_modpacks, width=22).pack(side="left",
-                                                                                                       padx=2)
-        ttk.Button(path_btn_frame, text="📂 커스텀 모드팩 폴더 수동 지정...", command=self.browse_custom_path).pack(side="right",
-                                                                                                       padx=2)
-
-        # ==========================================
-        # 하단 영역: 실시간 로그 콘솔 및 상태바
-        # ==========================================
-
-        progress_frame = ttk.Frame(main_container)
-        progress_frame.pack(fill="x", side="bottom", pady=5)
-
-        self.status_label = ttk.Label(progress_frame, text="대기 중... (준비 완료)", font=("Malgun Gothic", 10, "bold"),
-                                      foreground="#2980b9")
-        self.status_label.pack(anchor="w", pady=(0, 2))
-
-        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
-        self.progress_bar.pack(fill="x", pady=(0, 5))
-
-        self.run_btn = ttk.Button(
-            progress_frame,
-            text="🚀 초고속 자동 번역 및 리소스팩 패키징 시작",
-            style="Action.TButton",
-            command=self.start_translation_thread
-        )
-        self.run_btn.pack(fill="x", ipady=6)
-        log_lf = ttk.LabelFrame(main_container, text=" 실시간 진행 로그 콘솔 ", padding=5)
-        log_lf.pack(fill="both", expand=True, pady=5)
-
-        self.log_text = tk.Text(
-            log_lf, background="#1e1e1e", foreground="#d4d4d4",
-            insertbackground="white", font=("Consolas", 9), state="disabled", wrap="word"
-        )
-        self.log_text.pack(fill="both", expand=True, side="left")
-
-        log_scroll = ttk.Scrollbar(log_lf, orient="vertical", command=self.log_text.yview)
-        log_scroll.pack(side="right", fill="y")
-        self.log_text.config(yscrollcommand=log_scroll.set)
-
-    def append_log(self, message):
-        self.log_text.config(state="normal")
-        self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state="disabled")
-        self.update_idletasks()
-
-    def update_status(self, text):
-        self.status_label.config(text=text)
-        self.update_idletasks()
-
-    # ==========================================
-    # 📌 [새로운 함수] 라디오 버튼 변경에 따른 UI 토글 및 기존 입력값 로드
-    # ==========================================
-    def on_engine_change(self):
-        """엔진 선택에 맞춰 하단 입력창을 동적으로 재구성합니다."""
-        # 기존 구성요소 파괴 처리
-        for widget in self.api_content_frame.winfo_children():
-            widget.destroy()
-
-        choice = self.engine_var.get()
-
-        # 각 변경 발생 시 데이터 유실 방지를 위해 JSON 세이브 연동 유도 조치 정의 가능
-        if choice == "1":  # Google (무료)
-            lbl = ttk.Label(self.api_content_frame, text="💡 Google 번역기는 별도의 API 키나 인증 주소가 필요하지 않습니다.",
-                            foreground="#7f8c8d")
-            lbl.pack(pady=10, padx=10, anchor="w")
-
-        elif choice == "2":  # Papago
-            frame = ttk.Frame(self.api_content_frame)
-            frame.pack(fill="x", pady=5, padx=5)
-            ttk.Label(frame, text="Papago API Key (X-Naver-Client-Secret):", width=32, anchor="e").pack(side="left",
-                                                                                                        padx=5)
-            ent = ttk.Entry(frame, textvariable=self.api_key_var, show="*")
-            ent.pack(side="left", fill="x", expand=True, padx=5)
-            ent.bind("<KeyRelease>", lambda e: self.save_api_settings_to_config())
-
-        elif choice in ["3", "5"]:  # ChatGPT (3) / Gemini (5)
-            engine_name = "ChatGPT" if choice == "3" else "Gemini"
-
-            # API Key 라인
-            f1 = ttk.Frame(self.api_content_frame)
-            f1.pack(fill="x", pady=2, padx=5)
-            ttk.Label(f1, text=f"{engine_name} API 인증 키 (API KEY):", width=32, anchor="e").pack(side="left", padx=5)
-            ent1 = ttk.Entry(f1, textvariable=self.api_key_var, show="*")
-            ent1.pack(side="left", fill="x", expand=True, padx=5)
-            ent1.bind("<KeyRelease>", lambda e: self.save_api_settings_to_config())
-
-            # 모델 지정 라인
-            f2 = ttk.Frame(self.api_content_frame)
-            f2.pack(fill="x", pady=2, padx=5)
-            ttk.Label(f2, text="사용할 인공지능 모델명 (Model):", width=32, anchor="e").pack(side="left", padx=5)
-            ent2 = ttk.Entry(f2, textvariable=self.model_name_var)
-            ent2.pack(side="left", fill="x", expand=True, padx=5)
-            ent2.bind("<KeyRelease>", lambda e: self.save_api_settings_to_config())
-
-        elif choice == "4":  # 로컬 NLLB
-            frame = ttk.Frame(self.api_content_frame)
-            frame.pack(fill="x", pady=5, padx=5)
-            ttk.Label(frame, text="로컬 NLLB 호스트 주소 URL (Endpoint):", width=32, anchor="e").pack(side="left", padx=5)
-            ent = ttk.Entry(frame, textvariable=self.endpoint_url_var)
-            ent.pack(side="left", fill="x", expand=True, padx=5)
-            ent.bind("<KeyRelease>", lambda e: self.save_api_settings_to_config())
-
-        # 동적 변경에 따른 UI 크기 즉시 전파 리프레시
-        self.update_idletasks()
-
-    # ==========================================
-    # 📌 [새로운 함수] 설정 데이터 실시간 영구 보존 및 불러오기 기능
-    # ==========================================
-    def init_config_and_scan(self):
-        """기존 런처 정보 외에 API 정보가 포함된 확장 config를 안전하게 연동 및 스캔합니다."""
-        # 1. 기존 cli_translator의 불러오기 함수 기반으로 뼈대 가져오기
+    def init_app(self):
+        """앱 기동 시 HTML 내부로 기존 설정 데이터 및 모드팩 정보 자동 주입"""
         self.config_data = load_or_setup_launcher_paths()
 
-        # 2. UI Entry 변수들에 경로 배치
-        self.cf_path_var.set(self.config_data.get("CurseForge", ""))
-        self.pm_path_var.set(self.config_data.get("Prism Launcher", ""))
-        self.mr_path_var.set(self.config_data.get("Modrinth App", ""))
+        # 저장된 엔진 및 키셋 방어선 구축
+        saved_config = {
+            "launcher_paths": {
+                "CurseForge": self.config_data.get("CurseForge", ""),
+                "Prism": self.config_data.get("Prism Launcher", ""),
+                "Modrinth": self.config_data.get("Modrinth App", "")
+            },
+            "saved_engine_choice": self.config_data.get("saved_engine_choice", "1"),
+            "saved_api_key": self.config_data.get("saved_api_key", ""),
+            "saved_model_name": self.config_data.get("saved_model_name", ""),
+            "saved_endpoint_url": self.config_data.get("saved_endpoint_url", "http://192.168.0.35:8000/translate")
+        }
 
-        # 3. 신규 API 변수 로드 (기본값 방어선 구축)
-        self.api_key_var.set(self.config_data.get("saved_api_key", ""))
-        self.model_name_var.set(self.config_data.get("saved_model_name", ""))
-        self.endpoint_url_var.set(self.config_data.get("saved_endpoint_url", "http://192.168.0.35:8000/translate"))
-
-        # 4. 저장되었던 번역기 엔진 선택 기록이 있다면 불러오기 (없으면 최초 구글 '1')
-        saved_engine = self.config_data.get("saved_engine_choice", "1")
-        self.engine_var.set(saved_engine)
-
-        # 5. UI 초기 뷰 동기화 및 모드팩 스캔 진행
-        self.on_engine_change()
-        self.scan_modpacks()
-
-    def save_api_settings_to_config(self):
-        """사용자가 입력 필드 타이핑 시 실시간으로 메모리 설정을 JSON에 미러링하여 영구 보존합니다."""
-        self.config_data["saved_engine_choice"] = self.engine_var.get()
-        self.config_data["saved_api_key"] = self.api_key_var.get()
-        self.config_data["saved_model_name"] = self.model_name_var.get()
-        self.config_data["saved_endpoint_url"] = self.endpoint_url_var.get()
-
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config_data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            pass
-
-    def browse_launcher_path(self, launcher_name, text_var):
-        chosen_dir = filedialog.askdirectory(title=f"[{launcher_name}] 기본 인스턴스/프로필 폴더 선택")
-        if chosen_dir:
-            chosen_dir = os.path.normpath(chosen_dir)
-            text_var.set(chosen_dir)
-            self.config_data[launcher_name] = chosen_dir
-            self.save_api_settings_to_config()
-            self.append_log(f"💾 [{launcher_name}] 탐색 경로가 변경 및 자동 저장되었습니다.")
-            self.scan_modpacks()
-
-    def scan_modpacks(self):
-        self.pack_listbox.delete(0, tk.END)
+        # 런처 자동 스캔 진행
         try:
             self.modpacks_data = find_modpacks_deep(self.config_data)
-            for pack in self.modpacks_data:
-                self.pack_listbox.insert(tk.END, f" [{pack['launcher']}]  {pack['name']}")
-            self.append_log(f"ℹ️ 모드팩 스캔 완료: 총 {len(self.modpacks_data)}개의 인스턴스가 확인되었습니다.")
         except Exception as e:
-            self.append_log(f"⚠️ 모드팩 자동 스캔 중 예외 발생: {e}")
+            self.modpacks_data = []
 
-    def on_pack_select(self, event):
-        selection = self.pack_listbox.curselection()
-        if selection:
-            idx = selection[0]
-            if idx < len(self.modpacks_data):
-                self.selected_pack_info = self.modpacks_data[idx]
-                self.append_log(f"🎯 작업 타겟 지정 완료 -> {self.selected_pack_info['name']}")
+        # 웹 프론트엔드로 로드 결과 일괄 전송 초기화
+        if self.window:
+            self.window.evaluate_js(
+                f"onBackendConfigLoaded({json.dumps(saved_config)}, {json.dumps(self.modpacks_data)});")
 
-    def browse_custom_path(self):
-        custom_path = filedialog.askdirectory(title="번역할 모드팩 루트 혹은 .minecraft 폴더를 선택하세요.")
-        if not custom_path:
-            return
-
-        config_path = os.path.join(custom_path, "config")
-        if not os.path.exists(config_path) and os.path.exists(os.path.join(custom_path, ".minecraft", "config")):
-            config_path = os.path.join(custom_path, ".minecraft", "config")
-            custom_path = os.path.join(custom_path, ".minecraft")
-        elif not os.path.exists(config_path) and os.path.exists(os.path.join(custom_path, "minecraft", "config")):
-            config_path = os.path.join(custom_path, "minecraft", "config")
-            custom_path = os.path.join(custom_path, "minecraft")
-
-        self.selected_pack_info = {
-            "launcher": "Custom",
-            "name": os.path.basename(custom_path.rstrip("\\/")),
-            "root_path": custom_path,
-            "config_path": config_path
-        }
-        self.modpacks_data.append(self.selected_pack_info)
-        self.pack_listbox.insert(tk.END, f" [Custom]  {self.selected_pack_info['name']} (수동 지정)")
-        self.pack_listbox.select_clear(0, tk.END)
-        self.pack_listbox.select_set(tk.END)
-        self.append_log(f"📂 수동 지정 인스턴스 추가 완료: {custom_path}")
-
-    def start_translation_thread(self):
-        if not self.selected_pack_info:
-            messagebox.showwarning("대상 미선택", "번역 작업을 시작할 모드팩 인스턴스를 목록에서 클릭해 주세요.")
-            return
-
-        # 📌 번역을 시작하기 전에 화면에 입력된 최신 값을 강제로 캐시에 반영 및 .env 동기화
-        self.save_api_settings_to_config()
-        self.sync_env_file_with_inputs()
-
-        self.run_btn.config(state="disabled")
-        translation_worker = threading.Thread(target=self.run_translation_logic, daemon=True)
-        translation_worker.start()
-
-    def sync_env_file_with_inputs(self):
-        """GUI에서 입력된 정보를 기존 모듈의 api.env 파일 규격과 완벽하게 매칭시켜 내보냅니다."""
-        choice = self.engine_var.get()
-        lines = []
-
-        # Papago, ChatGPT, Gemini에 맞는 환경변수명을 찾아 매핑 파일 작성
-        if choice == "2":
-            lines.append(f"PAPAGO_SECRET={self.api_key_var.get()}\n")
-        elif choice == "3":
-            lines.append(f"OPENAI_API_KEY={self.api_key_var.get()}\n")
-            if self.model_name_var.get().strip():
-                lines.append(f"CHATGPT_MODEL={self.model_name_var.get().strip()}\n")
-        elif choice == "5":
-            lines.append(f"GEMINI_API_KEY={self.api_key_var.get()}\n")
-            if self.model_name_var.get().strip():
-                lines.append(f"GEMINI_MODEL={self.model_name_var.get().strip()}\n")
-
-        # api.env 파일 쓰기 전개 (로컬 NLLB는 인스턴스 자체 인자로 바로 전달 처리 유연성 방어)
+    def save_config_from_html(self, updated_config_js):
+        """웹 브라우저단에서 키 입력이나 경로 변경 발생 시 실시간 동기화 저장"""
         try:
-            with open(ENV_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+            data = json.loads(updated_config_js)
+            self.config_data["saved_engine_choice"] = data.get("saved_engine_choice", "1")
+            self.config_data["saved_api_key"] = data.get("saved_api_key", "")
+            self.config_data["saved_model_name"] = data.get("saved_model_name", "")
+            self.config_data["saved_endpoint_url"] = data.get("saved_endpoint_url", "")
+
+            # 런처 패스 업데이트
+            paths = data.get("launcher_paths", {})
+            self.config_data["CurseForge"] = paths.get("CurseForge", "")
+            self.config_data["Prism Launcher"] = paths.get("Prism", "")
+            self.config_data["Modrinth App"] = paths.get("Modrinth", "")
+
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.config_data, f, ensure_ascii=False, indent=4)
         except Exception:
             pass
 
-    def run_translation_logic(self):
-        try:
-            src_match = re.search(r'\(([^)]+)\)', self.src_lang_combo.get())
-            dest_match = re.search(r'\(([^)]+)\)', self.dest_lang_combo.get())
+    def browse_folder(self, launcher_key):
+        """웹에서 '변경' 버튼 클릭 시 파이썬 고유 디렉토리 탐색기 오픈"""
+        chosen_dir = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        if chosen_dir:
+            path_str = os.path.normpath(chosen_dir[0])
+            # 다시 스캔하여 최신 리스트와 함께 경로 반환
+            if launcher_key == "CurseForge":
+                self.config_data["CurseForge"] = path_str
+            elif launcher_key == "Prism":
+                self.config_data["Prism Launcher"] = path_str
+            elif launcher_key == "Modrinth":
+                self.config_data["Modrinth App"] = path_str
 
-            src_lang = src_match.group(1) if src_match else "en"
-            dest_lang = dest_match.group(1) if dest_match else "ko"
-            skip_chapters = self.skip_chapters_var.get()
-            choice = self.engine_var.get()
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.config_data, f, ensure_ascii=False, indent=4)
+
+            self.modpacks_data = find_modpacks_deep(self.config_data)
+            return json.dumps({"status": "success", "path": path_str, "modpacks": self.modpacks_data})
+        return json.dumps({"status": "cancel"})
+
+    def start_translation_pipeline(self, request_data_js):
+        """번역 시작 신호를 받으면 백그라운드 스레드로 연산 코어 기동"""
+        req_data = json.loads(request_data_js)
+        threading.Thread(target=self._run_translation_core, args=(req_data,), daemon=True).start()
+
+    def _run_translation_core(self, req_data):
+        try:
+            src_lang = req_data.get("src_lang", "en")
+            dest_lang = req_data.get("dest_lang", "ko")
+            skip_chapters = req_data.get("skip_chapters", True)
+            choice = req_data.get("engine_choice", "1")
+            selected_idx = req_data.get("selected_pack_idx")
+
+            if selected_idx is None or selected_idx >= len(self.modpacks_data):
+                self.window.evaluate_js("alert('번역 대상 모드팩 인스턴스가 올바르지 않습니다.');")
+                self.window.evaluate_js("toggleUIProcessing(false);")
+                return
+
+            pack_info = self.modpacks_data[selected_idx]
+
+            # api.env 가상 파일 연동 동기화
+            lines = []
+            api_key = self.config_data.get("saved_api_key", "")
+            model_name = self.config_data.get("saved_model_name", "").strip()
+            if choice == "2":
+                lines.append(f"PAPAGO_SECRET={api_key}\n")
+            elif choice == "3":
+                lines.append(f"OPENAI_API_KEY={api_key}\n")
+                if model_name: lines.append(f"CHATGPT_MODEL={model_name}\n")
+            elif choice == "5":
+                lines.append(f"GEMINI_API_KEY={api_key}\n")
+                if model_name: lines.append(f"GEMINI_MODEL={model_name}\n")
+            try:
+                with open(ENV_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+            except Exception:
+                pass
 
             final_lang_code = get_final_lang_code(dest_lang)
             output_folder = "output"
             temp_build_folder = "temp_build"
 
             os.makedirs(output_folder, exist_ok=True)
-            if os.path.exists(temp_build_folder):
-                shutil.rmtree(temp_build_folder)
+            if os.path.exists(temp_build_folder): shutil.rmtree(temp_build_folder)
             os.makedirs(temp_build_folder, exist_ok=True)
 
-            self.append_log("\n" + "=" * 60)
-            self.append_log(f"🔄 번역 파이프라인 시작 (엔진 번호: {choice} | {src_lang} -> {dest_lang})")
+            self.log_to_html("=" * 75)
+            self.log_to_html(f"🔄 웹 제어 엔진 연동 완수 -> 번역 파이프라인 기동 (엔진: {choice} | {src_lang} -> {dest_lang})")
 
-            # 1. 로컬 기번역 캐시 수집 코어 작동
-            self.update_status("⚙️ 초기화 단계: 로컬 기번역 탐색 및 학습 중...")
+            # 1. 로컬 기번역 기계학습
+            self.update_status_to_html("⚙️ 초기화 단계: 로컬 기번역 사전 탐색 및 학습 중...", 3)
             original_cwd = os.getcwd()
             try:
-                os.chdir(self.selected_pack_info['root_path'])
-                if dest_lang in ["ko_kr", "ko"]:
-                    scan_and_build_local_glossary()
+                os.chdir(pack_info['root_path'])
+                if dest_lang in ["ko_kr", "ko"]: scan_and_build_local_glossary()
             except Exception as e:
-                self.append_log(f"[경고] 로컬 번역 병합 스킵: {e}")
+                self.log_to_html(f"[경고] 로컬 번역 병합 스킵: {e}")
             finally:
-                os.chdir(original_cwd)
+                os.getcwd(); os.chdir(original_cwd)
 
-            # 2. 번역 엔진 인스턴스 빌딩
-            # 로컬 NLLB(4)일 경우 사용자가 입력한 커스텀 엔드포인트 URL을 명시적으로 투입할 수 있도록 우회 코드 처리
-            if choice == "4" and self.endpoint_url_var.get().strip():
-                # 모듈 내부 호환성을 깨지 않기 위해 기본 translator 할당 후 엔드포인트 주입 필터
+            # 2. 엔진 인스턴스 핸들링
+            if choice == "4" and self.config_data.get("saved_endpoint_url", "").strip():
                 translator, max_batch_chars = get_translator(choice, src_lang, dest_lang)
                 if translator and hasattr(translator, 'endpoint'):
-                    translator.endpoint = self.endpoint_url_var.get().strip()
+                    translator.endpoint = self.config_data.get("saved_endpoint_url", "").strip()
             else:
                 translator, max_batch_chars = get_translator(choice, src_lang, dest_lang)
 
             if not translator:
-                self.append_log("❌ [오류] 번역 엔진 빌드 실패 (입력된 API Key 혹은 설정을 다시 확인하세요)")
-                self.run_btn.config(state="normal")
-                self.update_status("❌ 엔진 빌드 실패")
+                self.log_to_html("❌ [오류] 번역기 엔진 빌드 실패! 설정을 재조정하세요.")
+                self.update_status_to_html("❌ 엔진 빌드 에러", 0)
+                self.window.evaluate_js("toggleUIProcessing(false);")
                 return
 
-            # 3. 대상 리소스 파일 1차 스캔
-            tasks_to_run = parse_target_localization_files(
-                self.selected_pack_info['config_path'], self.selected_pack_info['root_path'], src_lang, final_lang_code
-            )
-
+            # 3. 타겟 자원 파일 파싱
+            tasks_to_run = parse_target_localization_files(pack_info['config_path'], pack_info['root_path'], src_lang,
+                                                           final_lang_code)
             if not tasks_to_run:
-                self.append_log("ℹ️ [안내] 처리 가능한 유효 언어 리소스 파일(.json / .snbt)이 존재하지 않습니다.")
-                if os.path.exists(temp_build_folder):
-                    shutil.rmtree(temp_build_folder)
-                self.run_btn.config(state="normal")
-                self.update_status("ℹ️ 유효한 번역 자원 없음")
+                self.log_to_html("ℹ️ 처리 가능한 유효 언어 리소스 파일(.json / .snbt)이 검출되지 않았습니다.")
+                if os.path.exists(temp_build_folder): shutil.rmtree(temp_build_folder)
+                self.update_status_to_html("ℹ️ 번역 대상 리소스 없음", 100)
+                self.window.evaluate_js("toggleUIProcessing(false);")
                 return
 
-            # 4. 작업을 시작하기 전에 모든 파일의 배치(Chunk) 선행 구성 완료
-            self.update_status("📋 분석 단계: 대량 배치 사전 컴파일 및 청크 계산 중...")
-            self.append_log("ℹ️ 모든 리소스 파일로부터 추출할 전체 배치 구조를 파악하고 있습니다...")
-
+            self.update_status_to_html("📋 분석 단계: 대량 배치 사전 컴파일 및 청크 계산 중...", 5)
             prepared_tasks = []
             total_chunks_count = 0
 
             for task in tasks_to_run:
                 content, matches, skip_map = extract_strings_from_file(task['input_path'], skip_chapters)
                 unique_matches = [t for t in set(matches) if not (skip_chapters and t in skip_map)]
-
                 existing_translations = task.get('existing_translations', {})
                 if existing_translations:
                     unique_matches = [m for m in unique_matches if m not in existing_translations]
 
-                chunks = []
-                if unique_matches:
-                    chunks = build_batches(unique_matches, max_batch_chars, encode_text)
-
+                chunks = build_batches(unique_matches, max_batch_chars, encode_text) if unique_matches else []
                 total_chunks_count += len(chunks)
+                prepared_tasks.append(
+                    {'task': task, 'content': content, 'matches': matches, 'skip_map': skip_map, 'chunks': chunks})
 
-                prepared_tasks.append({
-                    'task': task, 'content': content, 'matches': matches,
-                    'skip_map': skip_map, 'unique_matches': unique_matches, 'chunks': chunks
-                })
-
-            self.append_log(f"📦 분석 완료: 총 {len(tasks_to_run)}개 파일에서 총 [{total_chunks_count}]개의 API 전송 배치가 빌드되었습니다.")
-
-            self.progress_bar["maximum"] = max(total_chunks_count, 1)
-            self.progress_bar["value"] = 0
+            self.log_to_html(f"📦 분석 완료: 총 {len(tasks_to_run)}개 파일에서 [{total_chunks_count}]개의 네트워크 전송 청크 배치가 생성되었습니다.")
 
             processed_chunks_count = 0
             start_time = time.time()
 
-            # 5. 대량 치환/번역 작업 루프 시작
+            # 4. 핵심 번역 루프 실행
             for p_idx, p_task in enumerate(prepared_tasks):
                 task = p_task['task']
                 content = p_task['content']
@@ -537,14 +245,12 @@ class MinecraftTranslatorGUI(tk.Tk):
                     target_out_path = os.path.join(dir_name, f"{final_lang_code}{task['ext']}")
 
                 existing_translations = task.get('existing_translations', {})
-
                 if not chunks:
                     save_translated_file(target_out_path, content, existing_translations, task['ext'])
                     continue
 
-                self.append_log(
-                    f"▶️ [{p_idx + 1}/{len(prepared_tasks)}] {task['display_name']} ({len(chunks)}개 청크 순차 전송)")
-
+                self.log_to_html(
+                    f"▶️ [{p_idx + 1}/{len(prepared_tasks)}] {task['display_name']} ({len(chunks)} 청크 처리 시작)")
                 translated_map = dict(existing_translations)
                 for text in matches:
                     if not text.strip() or text.startswith('{@') or (skip_chapters and text in skip_map):
@@ -555,66 +261,65 @@ class MinecraftTranslatorGUI(tk.Tk):
                     translated_map.update(batch_result)
 
                     processed_chunks_count += 1
-                    self.progress_bar["value"] = processed_chunks_count
+                    current_pct = int((processed_chunks_count / max(total_chunks_count, 1)) * 90) + 5  # 5%~95% 구간 할당
 
-                    current_pct = int((processed_chunks_count / total_chunks_count) * 100)
-                    elapsed_time = time.time() - start_time
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / processed_chunks_count
+                    eta = int(avg_time * (total_chunks_count - processed_chunks_count))
+                    eta_str = f"| ⏳ 남은시간: 약 {eta // 60}분 {eta % 60}초"
 
-                    avg_time_per_chunk = elapsed_time / processed_chunks_count
-                    remaining_chunks = total_chunks_count - processed_chunks_count
-                    eta_seconds = int(avg_time_per_chunk * remaining_chunks)
-
-                    eta_min = eta_seconds // 60
-                    eta_sec = eta_seconds % 60
-                    eta_str = f"| ⏳ 남은 시간: 약 {eta_min}분 {eta_sec}초"
-
-                    self.update_status(
-                        f"⚡ 진행률: {current_pct}% ({processed_chunks_count}/{total_chunks_count} 배치 완료) {eta_str}")
-                    self.append_log(f"   ↳ 청크 처리 중 [{c_idx + 1}/{len(chunks)}] - 완료")
+                    self.update_status_to_html(
+                        f"⚡ 진행률: {int((processed_chunks_count / total_chunks_count) * 100)}% ({processed_chunks_count}/{total_chunks_count} 청크 전송 완료) {eta_str}",
+                        current_pct)
+                    self.log_to_html(f"   ↳ 청크 처리 중 [{c_idx + 1}/{len(chunks)}] - 전송 완수")
 
                 save_translated_file(target_out_path, content, translated_map, task['ext'])
 
-            # ==========================================
-            # 6. 빌드 완료 데이터 최종 ZIP 리소스팩 배포 패키징
-            # ==========================================
-            self.update_status("📦 100% 번역 완수! 리소스 팩 패키징 완료 단계 진입...")
-            clean_pack_name = re.sub(r'[\/:*?"<>| ]', '_', self.selected_pack_info['name'])
+            # 5. 최종 리소스팩 패키징 빌드
+            self.update_status_to_html("📦 100% 번역 완수! 최종 배포 리소스팩(ZIP) 패키징 단계 진입...", 95)
+            clean_pack_name = re.sub(r'[\/:*?"<>| ]', '_', pack_info['name'])
             date_str = datetime.now().strftime("%m%d")
             zip_filename = f"{clean_pack_name}_{date_str}_{final_lang_code}.zip"
             final_zip_path = os.path.join(output_folder, zip_filename)
 
-            self.append_log(f"\n📦 후처리: 임시 데이터 구조를 통합 배포 리소스팩(ZIP)으로 압축 중...")
+            self.log_to_html(f"\n📦 후처리 배포 팩 압축 생성 중 -> {zip_filename}")
             with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for root, dirs, files in os.walk(temp_build_folder):
                     for file in files:
-                        full_file_path = os.path.join(root, file)
-                        archive_name = os.path.relpath(full_file_path, temp_build_folder)
-                        zipf.write(full_file_path, archive_name)
+                        full_p = os.path.join(root, file)
+                        zipf.write(full_p, os.path.relpath(full_p, temp_build_folder))
 
             shutil.rmtree(temp_build_folder)
-
-            self.progress_bar["value"] = total_chunks_count
             total_elapsed = time.time() - start_time
-            t_min = int(total_elapsed // 60)
-            t_sec = int(total_elapsed % 60)
 
-            self.update_status(f"✅ 총 작업 완수 (소요시간: {t_min}분 {t_sec}초)")
+            self.log_to_html(f"============================================================")
+            self.log_to_html(f"🎉 리소스팩 패키징 완수! 총 {int(total_elapsed // 60)}분 {int(total_elapsed % 60)}초가 소요되었습니다.")
+            self.log_to_html(f"➔ 파일 저장 절대 경로: {os.path.abspath(final_zip_path)}")
+            self.log_to_html(f"============================================================")
 
-            self.append_log(f"============================================================")
-            self.append_log(f"🎉 리소스팩 패키징 완수! 총 {t_min}분 {t_sec}초가 소요되었습니다.")
-            self.append_log(f"➔ 저장 경로: {os.path.abspath(final_zip_path)}")
-            self.append_log(f"============================================================")
-
-            self.run_btn.config(state="normal")
-            messagebox.showinfo("완료", f"배포용 리소스팩 패키징 작업이 정상 완료되었습니다!\n\n결과물: {zip_filename}")
+            self.update_status_to_html("✅ 모든 작업이 완벽하게 완료되었습니다!", 100)
+            self.window.evaluate_js(f"alert('번역 및 리소스팩 패키징이 성공적으로 끝났습니다!\\n\\n결과물: {zip_filename}');")
+            self.window.evaluate_js("toggleUIProcessing(false);")
 
         except Exception as e:
-            self.append_log(f"\n❌ [오류 발생으로 인한 작업 중단]: {str(e)}")
-            self.run_btn.config(state="normal")
-            self.update_status("❌ 작업 중단 오류 발생")
-            messagebox.showerror("번역 실패", f"작업 도중 오류가 발생했습니다:\n{str(e)}")
+            self.log_to_html(f"\n❌ [오류 발생으로 인한 작업 중단]: {str(e)}")
+            self.update_status_to_html("❌ 번역 파이프라인 중단 에러 발생", 0)
+            self.window.evaluate_js(f"alert('작업 도중 에러가 발생했습니다:\\n{str(e)}');")
+            self.window.evaluate_js("toggleUIProcessing(false);")
 
 
 if __name__ == "__main__":
-    app = MinecraftTranslatorGUI()
-    app.mainloop()
+    bridge = WebGUIBridge()
+    # 로컬 HTML 파일을 로드하여 런처 구동 창 생성 (기본 크기 지정)
+    window = webview.create_window(
+        title="Minecraft Modpack High-Speed Web Translator",
+        url="index.html",
+        js_api=bridge,
+        width=880,
+        height=800,
+        min_size=(820, 720)
+    )
+    bridge.window = window
+
+    # 윈도우가 완전히 준비되면 초기 구성값 로딩 트리거 기동
+    webview.start(bridge.init_app)

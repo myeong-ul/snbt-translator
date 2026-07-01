@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Minecraft Modpack Translator UI</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
+        }
+
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+            padding: 15px;
+        }
+
+        .flex-row {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+
+        .flex-child {
+            flex: 1;
+        }
+
+        /* 세련된 카드 프레임 레이아웃 */
+        .card {
+            background: #1e1e1e;
+            border: 1px solid #2d2d2d;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 12px;
+        }
+
+        .card-title {
+            font-size: 14px;
+            font-weight: bold;
+            color: #3498db;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        label {
+            font-size: 13px;
+            color: #b0b0b0;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        select, input[type="text"], input[type="password"] {
+            width: 100%;
+            background: #2a2a2a;
+            color: #ffffff;
+            border: 1px solid #3d3d3d;
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-size: 13px;
+            outline: none;
+            margin-bottom: 8px;
+        }
+
+        select:focus, input:focus {
+            border-color: #3498db;
+        }
+
+        .radio-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .radio-lbl {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #e0e0e0;
+        }
+
+        .btn {
+            background: #2c3e50;
+            color: white;
+            border: none;
+            padding: 5px 12px;
+            font-size: 12px;
+            font-weight: bold;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn:hover {
+            background: #34495e;
+        }
+
+        .path-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .path-row label {
+            width: 90px;
+            margin-bottom: 0;
+            text-align: right;
+        }
+
+        /* 모드팩 리스트 스타일링 */
+        #pack-list {
+            background: #252526;
+            border: 1px solid #333;
+            border-radius: 4px;
+            height: 160px;
+            overflow-y: auto;
+            list-style: none;
+        }
+
+        #pack-list li {
+            padding: 8px 12px;
+            font-size: 13px;
+            border-bottom: 1px solid #2d2d2d;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        #pack-list li:hover {
+            background: #2a2d2e;
+        }
+
+        #pack-list li.selected {
+            background: #0e639c !important;
+            color: white;
+            font-weight: bold;
+        }
+
+        /* 대용량 검은색 실시간 로그 콘솔창 */
+        #console-area {
+            background: #000000;
+            border: 1px solid #333;
+            border-radius: 4px;
+            height: 205px;
+            overflow-y: auto;
+            padding: 10px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            color: #d4d4d4;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+
+        /* 하단 액션바 및 프로그레스 크기 규격 */
+        .bottom-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: #1a1a1a;
+            padding: 15px;
+            border-top: 1px solid #2d2d2d;
+        }
+
+        #status-txt {
+            font-size: 13px;
+            font-weight: bold;
+            color: #2980b9;
+            margin-bottom: 6px;
+        }
+
+        .progress-bg {
+            background: #2d2d2d;
+            border-radius: 4px;
+            height: 8px;
+            width: 100%;
+            margin-bottom: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            background: #3498db;
+            width: 0%;
+            height: 100%;
+            transition: width 0.1s linear;
+        }
+
+        .btn-action {
+            background: #3498db;
+            color: white;
+            width: 100%;
+            padding: 12px;
+            font-size: 14px;
+            font-weight: bold;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-action:hover {
+            background: #2980b9;
+        }
+
+        .btn-action:disabled {
+            background: #4a5a6a;
+            color: #8a9aaa;
+            cursor: not-allowed;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .pad-bottom {
+            margin-bottom: 110px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="pad-bottom" id="main-scroll-container">
+
+    <div class="flex-row">
+        <div class="card flex-child">
+            <div class="card-title"> 📡 1. 번역기 엔진 선택</div>
+            <div class="radio-group">
+                <label class="radio-lbl"><input checked name="engine" onchange="onEngineSwitch()" type="radio"
+                                                value="1"> Google (무료)</label>
+                <label class="radio-lbl"><input name="engine" onchange="onEngineSwitch()" type="radio" value="2"> Papago</label>
+                <label class="radio-lbl"><input name="engine" onchange="onEngineSwitch()" type="radio" value="3">
+                    ChatGPT</label>
+                <label class="radio-lbl"><input name="engine" onchange="onEngineSwitch()" type="radio" value="5"> Gemini
+                    (추천)</label>
+                <label class="radio-lbl"><input name="engine" onchange="onEngineSwitch()" type="radio" value="4"> 나만의 로컬
+                    NLLB</label>
+            </div>
+        </div>
+
+        <div class="card flex-child">
+            <div class="card-title"> ⚙️ 2. 언어 및 작업 옵션</div>
+            <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                <div style="flex: 1;">
+                    <label>출발 언어</label>
+                    <select id="src-lang">
+                        <option selected value="en">영어 (en)</option>
+                        <option value="ko">한국어 (ko)</option>
+                        <option value="ja">일본어 (ja)</option>
+                    </select>
+                </div>
+                <div style="flex: 1;">
+                    <label>도착 언어</label>
+                    <select id="dest-lang">
+                        <option selected value="ko">한국어 (ko)</option>
+                        <option value="en">영어 (en)</option>
+                    </select>
+                </div>
+            </div>
+            <label class="radio-lbl" style="margin-top: 15px;">
+                <input checked id="skip-chapters" type="checkbox"> 퀘스트 챕터명 및 그룹 번역 제외 (추천)
+            </label>
+        </div>
+    </div>
+
+    <div class="card id-dynamic-card" id="api-card">
+        <div class="card-title" id="api-card-title">🔑 번역기 상세 인증 설정</div>
+
+        <div class="api-box" id="box-google">
+            <div style="font-size: 12px; color: #888; padding: 5px 0;">💡 Google 번역기는 별도의 API 키나 인증 주소가 필요하지 않습니다.</div>
+        </div>
+
+        <div class="api-box hidden" id="box-api-key">
+            <label id="lbl-api-key">API 인증 키 (API KEY)</label>
+            <input id="input-api-key" onkeyup="pushConfigToBackend()" placeholder="인증 토큰 키 문자열 입력" type="password">
+        </div>
+
+        <div class="api-box hidden" id="box-model">
+            <label>사용할 인공지능 모델명 (Model)</label>
+            <input id="input-model-name" onkeyup="pushConfigToBackend()" placeholder="예: gpt-4o, gemini-1.5-flash 등"
+                   type="text">
+        </div>
+
+        <div class="api-box hidden" id="box-url">
+            <label>로컬 NLLB 호스트 주소 URL (Endpoint)</label>
+            <input id="input-endpoint-url" onkeyup="pushConfigToBackend()" placeholder="http://127.0.0.1:8000/translate"
+                   type="text">
+        </div>
+    </div>
+
+    <div class="card id-dynamic-card" id="launcher-path-card">
+        <div class="card-title">📂 런처 인스턴스 탐색 경로 설정</div>
+        <div class="path-row">
+            <label>CurseForge :</label>
+            <input id="path-cf" readonly style="margin-bottom:0;" type="text">
+            <button class="btn" onclick="triggerBrowse('CurseForge')">변경</button>
+        </div>
+        <div class="path-row">
+            <label>Prism :</label>
+            <input id="path-pm" readonly style="margin-bottom:0;" type="text">
+            <button class="btn" onclick="triggerBrowse('Prism')">변경</button>
+        </div>
+        <div class="path-row">
+            <label>Modrinth :</label>
+            <input id="path-mr" readonly style="margin-bottom:0;" type="text">
+            <button class="btn" onclick="triggerBrowse('Modrinth')">변경</button>
+        </div>
+    </div>
+
+    <div class="card" id="interactive-display-card">
+        <div class="card-title" id="display-title">📋 3. 대상 모드팩 및 인스턴스 선택</div>
+
+        <div id="panel-selection">
+            <ul id="pack-list">
+            </ul>
+            <div style="font-size: 11px; color: #888; margin-top: 5px;">* 목록에서 작업을 시작할 모드팩 인스턴스를 하나 선택하세요.</div>
+        </div>
+
+        <div class="hidden" id="panel-console">
+            <div id="console-area"></div>
+        </div>
+    </div>
+
+</div>
+
+<div class="bottom-bar">
+    <div id="status-txt">대기 중... (시스템 준비 완료)</div>
+    <div class="progress-bg">
+        <div class="progress-bar" id="main-progress"></div>
+    </div>
+    <button class="btn-action" id="btn-start" onclick="submitTranslationPipeline()">🚀 초고속 자동 번역 및 리소스팩 패키징 시작</button>
+</div>
+
+<script>
+    let globalModpacks = [];
+    let selectedPackIdx = null;
+
+    // 📌 가변 라디오 변경 엔진 제어 스위치
+    function onEngineSwitch() {
+        let choice = document.querySelector('input[name="engine"]:checked').value;
+
+        // 공통 레이아웃 숨김 초기화
+        document.querySelectorAll('.api-box').forEach(el => el.classList.add('hidden'));
+
+        if (choice === "1") {
+            document.getElementById('box-google').classList.remove('hidden');
+        } else if (choice === "2") {
+            document.getElementById('lbl-api-key').innerText = "Papago API Key (X-Naver-Client-Secret):";
+            document.getElementById('box-api-key').classList.remove('hidden');
+        } else if (choice === "3" || choice === "5") {
+            let name = (choice === "3") ? "ChatGPT" : "Gemini";
+            document.getElementById('lbl-api-key').innerText = name + " API 인증 키 (API KEY):";
+            document.getElementById('box-api-key').classList.remove('hidden');
+            document.getElementById('box-model').classList.remove('hidden');
+        } else if (choice === "4") {
+            document.getElementById('box-url').classList.remove('hidden');
+        }
+        pushConfigToBackend();
+    }
+
+    // 📌 입력 정보를 모아서 실시간 파이썬 백엔드로 전송 저장
+    function pushConfigToBackend() {
+        let choice = document.querySelector('input[name="engine"]:checked').value;
+        let currentConfig = {
+            saved_engine_choice: choice,
+            saved_api_key: document.getElementById('input-api-key').value,
+            saved_model_name: document.getElementById('input-model-name').value,
+            saved_endpoint_url: document.getElementById('input-endpoint-url').value,
+            launcher_paths: {
+                CurseForge: document.getElementById('path-cf').value,
+                Prism: document.getElementById('path-pm').value,
+                Modrinth: document.getElementById('path-mr').value
+            }
+        };
+        window.pywebview.api.save_config_from_html(JSON.stringify(currentConfig));
+    }
+
+    // 📌 파이썬 백엔드에서 초기 데이터 수신 시 인터페이스 바인딩
+    function onBackendConfigLoaded(config, modpacks) {
+        document.getElementById('path-cf').value = config.launcher_paths.CurseForge;
+        document.getElementById('path-pm').value = config.launcher_paths.Prism;
+        document.getElementById('path-mr').value = config.launcher_paths.Modrinth;
+
+        document.getElementById('input-api-key').value = config.saved_api_key;
+        document.getElementById('input-model-name').value = config.saved_model_name;
+        document.getElementById('input-endpoint-url').value = config.saved_endpoint_url;
+
+        // 라디오버튼 기매칭 셀렉트
+        let rb = document.querySelector('input[name="engine"][value="' + config.saved_engine_choice + '"]');
+        if (rb) rb.checked = true;
+        onEngineSwitch();
+
+        renderModpacks(modpacks);
+    }
+
+    function renderModpacks(modpacks) {
+        globalModpacks = modpacks;
+        let ul = document.getElementById('pack-list');
+        ul.innerHTML = "";
+        selectedPackIdx = null;
+
+        if (modpacks.length === 0) {
+            ul.innerHTML = "<li style='color:#888; text-align:center; padding-top:40px;'>스캔된 런처 인스턴스가 존재하지 않습니다. 탐색 경로를 맞춰보세요.</li>";
+            return;
+        }
+
+        modpacks.forEach((pack, idx) => {
+            let li = document.createElement('li');
+            li.innerText = "[" + pack.launcher + "] " + pack.name;
+            li.onclick = function () {
+                document.querySelectorAll('#pack-list li').forEach(el => el.classList.remove('selected'));
+                li.classList.add('selected');
+                selectedPackIdx = idx;
+            };
+            ul.appendChild(li);
+        });
+    }
+
+    function triggerBrowse(key) {
+        window.pywebview.api.browse_folder(key).then(response_json => {
+            let res = JSON.parse(response_json);
+            if (res.status === "success") {
+                if (key === "CurseForge") document.getElementById('path-cf').value = res.path;
+                else if (key === "Prism") document.getElementById('path-pm').value = res.path;
+                else if (key === "Modrinth") document.getElementById('path-mr').value = res.path;
+                renderModpacks(res.modpacks);
+            }
+        });
+    }
+
+    // 📌 [핵심 요구사항] 모드팩 선택 ↔ 실시간 통합 번역 콘솔 로그 전환 제어문
+    function toggleUIProcessing(processing) {
+        let startBtn = document.getElementById('btn-start');
+        if (processing) {
+            startBtn.disabled = true;
+
+            // 1. 헤더 텍스트 실시간 변경
+            document.getElementById('display-title').innerText = "🔄 실시간 통합 번역 파이프라인 콘솔 로그";
+
+            // 2. 다른 입력 옵션 카드들 숨김 애니메이션 처리 가능
+            document.getElementById('launcher-path-card').classList.add('hidden');
+            document.getElementById('api-card').classList.add('hidden');
+
+            // 3. 모드팩 선택창 숨기고 실시간 콘솔 가시화 개방
+            document.getElementById('panel-selection').classList.add('hidden');
+            document.getElementById('panel-console').classList.remove('hidden');
+
+            // 콘솔 내용 클리어 초기화
+            document.getElementById('console-area').innerHTML = "";
+        } else {
+            startBtn.disabled = false;
+            document.getElementById('display-title').innerText = "📋 3. 대상 모드팩 및 인스턴스 선택";
+
+            document.getElementById('launcher-path-card').classList.remove('hidden');
+            document.getElementById('api-card').classList.remove('hidden');
+
+            document.getElementById('panel-console').classList.add('hidden');
+            document.getElementById('panel-selection').classList.remove('hidden');
+        }
+    }
+
+    function submitTranslationPipeline() {
+        if (selectedPackIdx === null) {
+            alert('번역을 진행할 모드팩을 목록에서 마우스로 클릭해 주세요.');
+            return;
+        }
+
+        // 최신 설정 동기화 강제 푸시
+        pushConfigToBackend();
+
+        // 화면 동적 토글 전환 시작
+        toggleUIProcessing(true);
+
+        let requestData = {
+            src_lang: document.getElementById('src-lang').value,
+            dest_lang: document.getElementById('dest-lang').value,
+            skip_chapters: document.getElementById('skip-chapters').checked,
+            engine_choice: document.querySelector('input[name="engine"]:checked').value,
+            selected_pack_idx: selectedPackIdx
+        };
+
+        window.pywebview.api.start_translation_pipeline(JSON.stringify(requestData));
+    }
+
+    // 📌 백엔드 파이썬 호출 인터페이스 전용 수신 함수들
+    function appendLog(message) {
+        let consoleArea = document.getElementById('console-area');
+        consoleArea.innerText += message + "\n";
+        consoleArea.scrollTop = consoleArea.scrollHeight; // 항상 최하단 자동 스크롤
+    }
+
+    function updateStatus(text, pct) {
+        document.getElementById('status-txt').innerText = text;
+        document.getElementById('main-progress').style.width = pct + "%";
+    }
+</script>
+</body>
+</html>
