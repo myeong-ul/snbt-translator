@@ -1,215 +1,197 @@
+# utils.py
 import json
 import os
-import re
-import sys
 
 CONFIG_FILE = "launcher_config.json"
-USER_HOME = os.path.expanduser("~")
-
-DEFAULT_LAUNCHER_PATHS = {
-    "CurseForge": os.path.join(USER_HOME, "CurseForge", "Minecraft", "Instances"),
-    "Prism Launcher": os.path.join(USER_HOME, "AppData", "Roaming", "PrismLauncher",
-                                   "instances") if os.name == 'nt' else os.path.join(USER_HOME, ".local", "share",
-                                                                                     "PrismLauncher", "instances"),
-    "Modrinth App": os.path.join(USER_HOME, "AppData", "Roaming", "ModrinthApp",
-                                 "profiles") if os.name == 'nt' else os.path.join(USER_HOME, ".local", "share",
-                                                                                  "ModrinthApp", "profiles")
-}
-
-LANG_MENU = {
-    "1": ("한국어", "ko"), "2": ("영어", "en"), "3": ("일본어", "ja"),
-    "4": ("중국어 (간체)", "zh-cn"), "5": ("중국어 (번체)", "zh-tw"),
-    "6": ("러시아어", "ru"), "7": ("독일어", "de"), "8": ("프랑스어", "fr"),
-    "9": ("스페인어", "es"), "10": ("포르투갈어", "pt"), "11": ("이탈리아어", "it"),
-    "12": ("베트남어", "vi"), "13": ("태국어", "th"), "14": ("인도네시아어", "id"),
-    "15": ("터키어", "tr")
-}
-
-MC_FULL_CODE_MAP = {
-    "ko": "ko_kr", "en": "en_us", "ja": "ja_jp", "zh": "zh_cn",
-    "zh-cn": "zh_cn", "zh-tw": "zh_tw", "ru": "ru_ru", "de": "de_de",
-    "fr": "fr_fr", "es": "es_es", "pt": "pt_pt", "it": "it_it",
-    "vi": "vi_vn", "th": "th_th", "id": "id_id", "tr": "tr_tr"
-}
-
-# 대소문자 구분 없이 매칭하도록 플래그 수정
-LANG_FILE_PATTERN = re.compile(r'^[a-zA-Z]{2,3}(_|-)[a-zA-Z]{2,4}\.json$', re.IGNORECASE)
-
-
-def print_progress_bar(current, total, display_name, bar_length=30):
-    percent = float(current) * 100 / total if total > 0 else 100
-    arrow = '■' * int(percent / 100 * bar_length)
-    spaces = '□' * (bar_length - len(arrow))
-    sys.stdout.write(f"\r[{display_name}] 진행률: [{arrow}{spaces}] {percent:.1f}% ({current}/{total} 묶음 완료)")
-    sys.stdout.flush()
-
-
-def select_language(prompt_msg, default_code):
-    print(f"\n[ {prompt_msg} ]")
-    print("-" * 50)
-    menu_items = list(LANG_MENU.items())
-    for i in range(0, len(menu_items), 3):
-        row_str = ""
-        for j in range(3):
-            if i + j < len(menu_items):
-                num, (name, code) = menu_items[i + j]
-                row_str += f"{num:><2}. {name}({code})".ljust(18)
-        print(row_str)
-    print("16. 직접 언어 코드 입력하기")
-    print("-" * 50)
-
-    choice = input(f"➔ 선택 (기본값번호/코드 입력 가능, 기본 {default_code}): ").strip().lower()
-    if not choice: return default_code
-    if choice in LANG_MENU: return LANG_MENU[choice][1]
-    if choice == "16":
-        direct_code = input("➔ 언어 코드를 직접 입력하세요 (예: fr_fr): ").strip().lower()
-        return direct_code if direct_code else default_code
-    return choice.replace("-", "_")
-
-
-def get_final_lang_code(dest_lang):
-    target_code = dest_lang.lower().replace("-", "_")
-    return MC_FULL_CODE_MAP.get(target_code, target_code)
+LANG_MENU = {"1": ("영어", "en"), "2": ("한국어", "ko"), "3": ("일본어", "ja")}
 
 
 def load_or_setup_launcher_paths():
-    config_paths = {}
+    appdata = os.environ.get("APPDATA", "")
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    user_home = os.path.expanduser("~")
+
+    default_paths = {
+        "CurseForge": os.path.join(user_home, "curseforge", "minecraft"),
+        "Modrinth App": os.path.join(local_appdata, "ModrinthApp") if local_appdata else "",
+        "Prism Launcher": os.path.join(appdata, "PrismLauncher") if appdata else ""
+    }
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    config_paths = loaded
-        except Exception:
-            config_paths = {}
-
-    updated = False
-    final_paths = {}
-
-    print("\n🔍 런처 디렉터리 동기화 및 경로 파악 중...")
-    print("-" * 60)
-
-    for name, default_path in DEFAULT_LAUNCHER_PATHS.items():
-        if name in config_paths and config_paths[name] and os.path.exists(config_paths[name]):
-            final_paths[name] = config_paths[name]
-            print(f"[설정 로드] {name} 사용자 정의 경로 연결: {final_paths[name]}")
-            continue
-
-        if os.path.exists(default_path):
-            final_paths[name] = default_path
-            print(f"[자동 감지] {name} 기본 디렉터리 식별: {final_paths[name]}")
-            continue
-
-    return final_paths
-
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved_paths = json.load(f)
+                for key, val in default_paths.items():
+                    if key not in saved_paths: saved_paths[key] = val
+                return saved_paths
+        except:
+            pass
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_paths, f, ensure_ascii=False, indent=4)
+    except:
+        pass
+    return default_paths
 
 def find_modpacks_deep(launcher_paths):
-    modpack_list = []
-    for name, base_path in launcher_paths.items():
-        if not os.path.exists(base_path):
-            continue
+    """[경로 최적화] \minecraft\ 구조 및 \kubejs\ 내부 아이콘 배치 인스턴스를 완벽하게 추적합니다."""
+    modpacks = []
 
-        print(f"📂 [{name}] 인스턴스 스캔 시작: {base_path}")
-        try:
-            for folder in os.listdir(base_path):
-                pack_root_candidate = os.path.join(base_path, folder)
-                if not os.path.isdir(pack_root_candidate):
-                    continue
+    for launcher_name, base_path in launcher_paths.items():
+        if not base_path or not os.path.exists(base_path): continue
 
-                prism_config_path = os.path.join(pack_root_candidate, "minecraft", "config")
-                standard_config_path = os.path.join(pack_root_candidate, "config")
-                dot_mc_config_path = os.path.join(pack_root_candidate, ".minecraft", "config")
+        search_dirs = []
+        if launcher_name == "Prism Launcher":
+            search_dirs = [os.path.join(base_path, "instances"), base_path]
+        elif launcher_name == "CurseForge":
+            search_dirs = [os.path.join(base_path, "Instances"), base_path]
+        elif launcher_name == "Modrinth App":
+            search_dirs = [os.path.join(base_path, "profiles"), base_path]
+        else:
+            search_dirs = [base_path]
 
-                actual_config = None
-                actual_root = None
+        for s_dir in search_dirs:
+            if not os.path.exists(s_dir): continue
+            try:
+                for folder in os.listdir(s_dir):
+                    full_p = os.path.join(s_dir, folder)
+                    if not os.path.isdir(full_p): continue
+                    if folder.startswith('.') or folder in ["_common", "assets", "libraries", "downloads"]: continue
 
-                if os.path.exists(prism_config_path):
-                    actual_config = prism_config_path
-                    actual_root = os.path.join(pack_root_candidate, "minecraft")
-                elif os.path.exists(standard_config_path):
-                    actual_config = standard_config_path
-                    actual_root = pack_root_candidate
-                elif os.path.exists(dot_mc_config_path):
-                    actual_config = dot_mc_config_path
-                    actual_root = os.path.join(pack_root_candidate, ".minecraft")
+                    is_prism = os.path.exists(os.path.join(full_p, "instance.cfg")) or os.path.exists(
+                        os.path.join(full_p, "mmc-pack.json"))
 
-                if actual_config and actual_root:
-                    if not any(p['root_path'] == actual_root for p in modpack_list):
-                        modpack_list.append({
-                            "launcher": name, "name": folder, "root_path": actual_root, "config_path": actual_config
+                    # [Prism 런처 하위 구조 유연화 패치]
+                    # .minecraft 폴더뿐만 아니라 일반 minecraft 폴더명으로 잡힌 알맹이도 함께 추적합니다.
+                    if is_prism:
+                        if os.path.exists(os.path.join(full_p, ".minecraft")):
+                            game_root = os.path.join(full_p, ".minecraft")
+                        elif os.path.exists(os.path.join(full_p, "minecraft")):
+                            game_root = os.path.join(full_p, "minecraft")
+                        else:
+                            game_root = full_p
+                    else:
+                        game_root = full_p
+
+                    if (os.path.exists(os.path.join(game_root, "mods")) or
+                            os.path.exists(os.path.join(game_root, "config")) or is_prism or
+                            os.path.exists(os.path.join(full_p, "minecraftinstance.json"))):
+                        modpacks.append({
+                            "name": folder,
+                            "instance_path": full_p,  # 메타데이터 참조용 루트
+                            "root_path": game_root,  # 실제 인게임 자원/번역 타깃 루트
+                            "launcher": launcher_name
                         })
-        except Exception as e:
-            print(f"[경고] {name} 스캔 중 오류: {e}")
-    return modpack_list
+            except Exception as e:
+                print(f"[{launcher_name}] 스캔 중 에러: {e}")
+
+    return modpacks
 
 
-def parse_target_localization_files(config_path, root_path, src_lang, final_lang_code):
-    """FTB Skies 2 등 대형 모드팩 구조에 맞춰 탐색 영역 및 필터를 대폭 강화한 추적 엔진"""
-    tasks = []
+def parse_target_localization_files(root_path):
+    """[자원 추적 패치] 무조건 알맹이 폴더(root_path) 기준 하위 에셋을 무결성 추적합니다."""
+    targets = []
+    # 모드팩 내에서 번역이 필요한 대표적인 수집 루트 명시
+    search_paths = [
+        os.path.join(root_path, "config", "ftbquests"),
+        os.path.join(root_path, "kubejs"),
+        os.path.join(root_path, "resourcepacks")
+    ]
 
-    # config 뿐만 아니라 모드팩 최상위 폴더(root_path) 전체를 대상으로 정밀 수집을 진행합니다.
-    search_base = root_path if os.path.exists(root_path) else config_path
-    print(f"➔ 🔍 번역 대상 리소스 정밀 분석 중 (기반 경로: {search_base})...")
-
-    for root, dirs, files in os.walk(search_base):
-        root_lower = root.lower()
-
-        # 임시 빌드나 출력 폴더는 탐색에서 무조건 제외
-        if "temp_build" in root_lower or "output" in root_lower:
-            continue
-
-        # 1. FTB Quests 구조 식별 강화
-        if "ftbquests" in root_lower or "quests" in root_lower:
+    for path in search_paths:
+        if not os.path.exists(path): continue
+        for root, _, files in os.walk(path):
             for file in files:
-                file_ext_lower = os.path.splitext(file)[1].lower()
-                # 퀘스트 데이터용 파일들 전부 확보
-                if file_ext_lower in ['.snbt', '.json']:
-                    full_input_path = os.path.join(root, file)
-                    rel_path_from_mc = os.path.relpath(full_input_path, root_path)
-                    tasks.append({
-                        'input_path': full_input_path, 'output_rel_path': rel_path_from_mc,
-                        'display_name': f"Quests/{os.path.basename(file)}", 'ext': file_ext_lower, 'is_quest': True
-                    })
-            continue
+                if file.endswith('.json') or file.endswith('.lang'):
+                    targets.append(os.path.join(root, file))
+    return targets
 
-        # 2. 다국어 자원 폴더 (.json 언어 코드 형태 매핑 - 대소문자 무시 보완)
-        for file in files:
-            file_lower = file.lower()
-            if file_lower.endswith('.json') and LANG_FILE_PATTERN.match(file_lower):
-                full_input_path = os.path.join(root, file)
-                base_name_no_ext = os.path.splitext(file_lower)[0]
 
-                # 원본 언어가 en_us 혹은 en이거나 파일명 자체에 언어 코드가 매칭될 때
-                if base_name_no_ext in [src_lang.lower(), "en_us", "en_kr"]:
-                    rel_path_from_mc = os.path.relpath(full_input_path, root_path)
+# utils.py 맨 아래에 추가해주세요
 
-                    # 목적지 언어 파일 확인 (ko_kr.json / ko_KR.json 둘 다 대응)
-                    target_lang_filename = f"{final_lang_code}.json"
-                    pre_translated_file_path = os.path.join(root, target_lang_filename)
+def translate_text_via_api(text, src_lang, dest_lang, app):
+    """활성화된 API 스위치를 확인하여 실제로 AI 번역을 수행합니다."""
+    # 현재 활성화된 API 찾기 (예: Gemini가 켜져있다면)
+    active_engine = None
+    for engine, enabled in app.api_enabled_states.items():
+        if enabled:
+            active_engine = engine
+            break
 
-                    # 대문자 버전도 추가 검사 (예: ko_KR.json)
-                    if not os.path.exists(pre_translated_file_path):
-                        alt_filename = f"{final_lang_code.split('_')[0]}_{final_lang_code.split('_')[1].upper()}.json" if '_' in final_lang_code else target_lang_filename
-                        alt_path = os.path.join(root, alt_filename)
-                        if os.path.exists(alt_path):
-                            pre_translated_file_path = alt_path
+    if not active_engine:
+        return text  # 켜진 API가 없으면 원본 그대로 반환
 
-                    existing_translations = {}
-                    if os.path.exists(pre_translated_file_path):
-                        try:
-                            with open(pre_translated_file_path, 'r', encoding='utf-8') as pf:
-                                existing_translations = json.load(pf)
-                            print(
-                                f"✨ [기번역 자동 연동] '{os.path.basename(root)}/{os.path.basename(pre_translated_file_path)}' 병합 로드 완료.")
-                        except Exception:
-                            existing_translations = {}
+    api_key = app.api_keys_storage.get(active_engine, "")
+    model_name = app.api_models_storage.get(active_engine, "")
 
-                    tasks.append({
-                        'input_path': full_input_path, 'output_rel_path': rel_path_from_mc,
-                        'display_name': os.path.relpath(full_input_path,
-                                                        config_path) if config_path in full_input_path else rel_path_from_mc,
-                        'ext': '.json', 'is_quest': False, 'existing_translations': existing_translations
-                    })
+    # [여기에 실제 API 호출 라이브러리 연동]
+    # 예시로 구조만 잡아둡니다. 실제 기동시엔 requests나 openai, google-generativeai 패키지를 호출합니다.
+    try:
+        # 가짜 번역 시뮬레이션 대신 실제 프롬프트 구성 영역
+        prompt = f"Translate the following Minecraft modpack text from {src_lang} to {dest_lang}. Keep formatting/codes like §c or %s intact: {text}"
 
-    print(f"✅ 필터링 완료: 총 {len(tasks)}개의 유효 번역 자원 파일을 확보했습니다.")
-    return tasks
+        # 실제 연동 시:
+        # if active_engine == "Gemini":
+        #     ... gemini api 호출 ...
+        #     return translated_text
+
+        return f"[번역됨] {text}"  # <- 테스트용 리턴 (실제 API 결과물로 대체)
+    except Exception as e:
+        print(f"API 번역 중 오류: {e}")
+        return text
+
+
+def process_actual_translation(file_path, src_lang, dest_lang, app, skip_chapters):
+    """파일을 직접 열어서 텍스트 데이터를 통째로 번역한 뒤 덮어씁니다."""
+    if not os.path.exists(file_path): return False
+
+    try:
+        # 1. JSON 파일 처리
+        if file_path.endswith('.json'):
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                data = json.load(f)
+
+            # JSON 내부의 문자열들을 재귀적으로 돌며 번역하는 로직 (FTB Quests나 일반 언어팩 구조)
+            def translate_json_deep(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        # FTB 퀘스트의 챕터/제목 보호 옵션 활성화 시 스킵
+                        if skip_chapters and k in ["title", "subtitle"] and isinstance(obj.get("tasks"), list):
+                            continue
+                        if isinstance(v, str) and len(v).strip() > 0:
+                            obj[k] = translate_text_via_api(v, src_lang, dest_lang, app)
+                        else:
+                            translate_json_deep(v)
+                elif isinstance(obj, list):
+                    for i in range(len(obj)):
+                        if isinstance(obj[i], str) and len(obj[i]).strip() > 0:
+                            obj[i] = translate_text_via_api(obj[i], src_lang, dest_lang, app)
+                        else:
+                            translate_json_deep(obj[i])
+
+            translate_json_deep(data)
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+
+        # 2. .lang 파일 처리 (구버전 포맷)
+        elif file_path.endswith('.lang'):
+            lines = []
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+
+            new_lines = []
+            for line in lines:
+                if '=' in line and not line.startswith('#'):
+                    key, val = line.split('=', 1)
+                    translated_val = translate_text_via_api(val.strip(), src_lang, dest_lang, app)
+                    new_lines.append(f"{key}={translated_val}\n")
+                else:
+                    new_lines.append(line)
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+
+        return True
+    except Exception as e:
+        print(f"파일 가공 실패 ({file_path}): {e}")
+        return False

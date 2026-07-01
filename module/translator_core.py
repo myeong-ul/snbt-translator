@@ -6,7 +6,6 @@ import requests
 from deep_translator import GoogleTranslator, PapagoTranslator, ChatGptTranslator
 from dotenv import set_key
 
-from cli_translator import ENV_FILE
 from module.encoder import load_glossary, save_glossary
 
 # ➔ 🚨 반드시 이 위치에 아래 구분자 변수가 선언되어 있어야 합니다!

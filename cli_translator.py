@@ -1,70 +1,39 @@
+import json
 import os
 import re
 import sys
-from dotenv import load_dotenv, set_key
-from deep_translator import GoogleTranslator, PapagoTranslator, ChatGptTranslator
 
-ENV_FILE = "api.env"
+CONFIG_FILE = "launcher_config.json"
+USER_HOME = os.path.expanduser("~")
 
-# ====================================================
-# 번역 제외 고유명사 리스트 (필요시 추가)
-# ====================================================
-PROPER_NOUNS = [
-    "Ad Astra",
-    "Mekanism",
-    "Netherite",
-    "Mithril",
-    "Steel Ingot",
-    "Redstone"
-]
+DEFAULT_LAUNCHER_PATHS = {
+    "CurseForge": os.path.join(USER_HOME, "CurseForge", "Minecraft", "Instances"),
+    "Prism Launcher": os.path.join(USER_HOME, "AppData", "Roaming", "PrismLauncher",
+                                   "instances") if os.name == 'nt' else os.path.join(USER_HOME, ".local", "share",
+                                                                                     "PrismLauncher", "instances"),
+    "Modrinth App": os.path.join(USER_HOME, "AppData", "Roaming", "ModrinthApp",
+                                 "profiles") if os.name == 'nt' else os.path.join(USER_HOME, ".local", "share",
+                                                                                  "ModrinthApp", "profiles")
+}
 
+LANG_MENU = {
+    "1": ("한국어", "ko"), "2": ("영어", "en"), "3": ("일본어", "ja"),
+    "4": ("중국어 (간체)", "zh-cn"), "5": ("중국어 (번체)", "zh-tw"),
+    "6": ("러시아어", "ru"), "7": ("독일어", "de"), "8": ("프랑스어", "fr"),
+    "9": ("스페인어", "es"), "10": ("포르투갈어", "pt"), "11": ("이탈리아어", "it"),
+    "12": ("베트남어", "vi"), "13": ("태국어", "th"), "14": ("인도네시아어", "id"),
+    "15": ("터키어", "tr")
+}
 
-def protect_proper_nouns(text):
-    protected_text = text
-    sorted_nouns = sorted(PROPER_NOUNS, key=len, reverse=True)
-    for idx, noun in enumerate(sorted_nouns):
-        pattern = re.compile(rf'\b{re.escape(noun)}\b', re.IGNORECASE)
-        protected_text = pattern.sub(f'___NOUN_{idx}___', protected_text)
-    return protected_text
+MC_FULL_CODE_MAP = {
+    "ko": "ko_kr", "en": "en_us", "ja": "ja_jp", "zh": "zh_cn",
+    "zh-cn": "zh_cn", "zh-tw": "zh_tw", "ru": "ru_ru", "de": "de_de",
+    "fr": "fr_fr", "es": "es_es", "pt": "pt_pt", "it": "it_it",
+    "vi": "vi_vn", "th": "th_th", "id": "id_id", "tr": "tr_tr"
+}
 
-
-def restore_proper_nouns(text):
-    restored_text = text
-    sorted_nouns = sorted(PROPER_NOUNS, key=len, reverse=True)
-    for idx, noun in enumerate(sorted_nouns):
-        pattern = re.compile(rf'___\s*NOUN_{idx}\s*___')
-        restored_text = pattern.sub(noun, restored_text)
-    return restored_text
-
-
-# ====================================================
-# [수정] 색상 코드 보호/복원 함수 (대괄호 태그 방식으로 변경)
-# ====================================================
-def protect_color_codes(text):
-    """ &c 구조를 번역기가 건드리지 않는 [#c] 형태로 변경합니다. """
-    pattern = re.compile(r'&([a-zA-F0-9klmnoorKLMNOOR])')
-    return pattern.sub(r'[#\1]', text)
-
-
-def restore_color_codes(text):
-    """
-    [#c] 구조를 다시 &c로 되돌립니다.
-    번역기가 임의로 넣을 수 있는 공백 [ # c ] 이나 [# c] 등도 모두 잡아냅니다.
-    """
-    # 번역기가 대괄호 내부에 공백을 집어넣었을 경우를 대비한 유연한 정규식
-    pattern = re.compile(r'\[\s*#\s*([a-zA-F0-9klmnoorKLMNOOR])\s*\]')
-    return pattern.sub(r'&\1', text)
-
-
-def load_or_request_api_key(key_name, provider_name):
-    load_dotenv(ENV_FILE)
-    api_key = os.getenv(key_name)
-    if not api_key:
-        print(f"\n[안내] {provider_name} API 키가 {ENV_FILE} 파일에 존재하지 않습니다.")
-        api_key = input(f"➔ {provider_name} API 키를 입력해주세요: ").strip()
-        set_key(ENV_FILE, key_name, api_key)
-        print(f"➔ {ENV_FILE} 파일에 키가 성공적으로 저장되었습니다.\n")
-    return api_key
+# 대소문자 구분 없이 매칭하도록 플래그 수정
+LANG_FILE_PATTERN = re.compile(r'^[a-zA-Z]{2,3}(_|-)[a-zA-Z]{2,4}\.json$', re.IGNORECASE)
 
 
 def print_progress_bar(current, total, display_name, bar_length=30):
@@ -75,207 +44,172 @@ def print_progress_bar(current, total, display_name, bar_length=30):
     sys.stdout.flush()
 
 
-def process_file_batch(full_input_path, full_output_path, display_name, translator, max_batch_chars, skip_chapters):
-    """파일 하나를 읽어 문장들을 배치(Batch)로 묶어 번역하고 지정된 경로에 저장합니다."""
-    os.makedirs(os.path.dirname(full_output_path), exist_ok=True)
-
-    with open(full_input_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    string_pattern = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
-    matches = string_pattern.findall(content)
-
-    skip_map = {}
-    if skip_chapters:
-        snbt_meta_pattern = re.compile(r'(filename|group)\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
-        for m in snbt_meta_pattern.finditer(content):
-            skip_map[m.group(2)] = True
-
-        lang_meta_pattern = re.compile(r'(file|chapter|chapter_group)\.[a-zA-Z0-9_.]+\s*[:=]\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
-        for m in lang_meta_pattern.finditer(content):
-            skip_map[m.group(2)] = True
-
-    unique_matches = []
-    for text in set(matches):
-        if skip_chapters and text in skip_map:
-            continue
-        unique_matches.append(text)
-
-    if not unique_matches:
-        print(f"[{display_name}] 번역할 문장이 없습니다 (모두 제외됨). 복사 중...")
-        with open(full_output_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        return
-
-    # ----------------------------------------------------
-    # 글자수 제한에 맞게 문장 묶기 (Batching)
-    # ----------------------------------------------------
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    DELIMITER = "\n[=]\n"
-
-    for text in unique_matches:
-        if not text.strip() or text.startswith('{@'):
-            continue
-
-        protected = protect_color_codes(text)
-        protected = protect_proper_nouns(protected)
-        estimated_len = len(protected) + len(DELIMITER)
-
-        if current_length + estimated_len > max_batch_chars:
-            chunks.append(current_chunk)
-            current_chunk = [protected]
-            current_length = len(protected)
-        else:
-            current_chunk.append(protected)
-            current_length += estimated_len
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    total_chunks = len(chunks)
-    print(f"[{display_name}] 총 문장 {len(matches)}개 -> {total_chunks}개 배치 결합 완료. 번역 시작...")
-
-    translated_map = {}
-    for text in matches:
-        if not text.strip() or text.startswith('{@'):
-            translated_map[text] = text
-        elif skip_chapters and text in skip_map:
-            translated_map[text] = text
-
-    # ----------------------------------------------------
-    # 묶음 단위 배치 번역 수행
-    # ----------------------------------------------------
-    for idx, chunk in enumerate(chunks):
-        combined_text = DELIMITER.join(chunk)
-
-        try:
-            translated_combined = translator.translate(text=combined_text)
-            translated_lines = translated_combined.split(DELIMITER)
-
-            for orig_protected, trans_protected in zip(chunk, translated_lines):
-                orig_raw = restore_proper_nouns(orig_protected)
-                orig_raw = restore_color_codes(orig_raw)
-
-                trans_raw = restore_proper_nouns(trans_protected.strip())
-                trans_raw = restore_color_codes(trans_raw)
-
-                translated_map[orig_raw] = trans_raw
-
-        except Exception as e:
-            print(f"\n[{display_name}] {idx + 1}번째 묶음 번역 실패 (원인: {e})")
-            for orig_protected in chunk:
-                orig_raw = restore_proper_nouns(orig_protected)
-                orig_raw = restore_color_codes(orig_raw)
-                translated_map[orig_raw] = orig_raw
-
-        print_progress_bar(idx + 1, total_chunks, display_name)
-
-    print(f"\n[{display_name}] 완료! 파일 조립 및 저장 중...")
-
-    final_content = string_pattern.sub(lambda m: f'"{translated_map.get(m.group(1), m.group(1))}"', content)
-    with open(full_output_path, 'w', encoding='utf-8') as f:
-        f.write(final_content)
-
-
-def main():
-    input_folder = "input"
-    output_folder = "output"
-
-    os.makedirs(input_folder, exist_ok=True)
-    os.makedirs(output_folder, exist_ok=True)
-
-    print("=" * 60)
-    print(" [안내] 주요 언어 코드 목록 (ISO 639-1)")
-    print(" - 한국어: ko  |  영어: en  |  일본어: ja  |  중국어: zh")
-    print("=" * 60)
-    print(" 사용할 번역기를 선택해 주세요.")
-    print(" 1. Google 번역 (무료)")
-    print(" 2. Naver Papago (API 키 필요)")
-    print(" 3. OpenAI ChatGPT (API 키 필요)")
-    print("=" * 60)
-    choice = input("선택 (1~3): ").strip()
-
-    src_lang = input("➔ 원본 언어 코드를 입력하세요 (기본 en): ").strip().lower() or 'en'
-    dest_lang = input("➔ 목적 언어 코드를 입력하세요 (기본 ko): ").strip().lower() or 'ko'
-
+def select_language(prompt_msg, default_code):
+    print(f"\n[ {prompt_msg} ]")
     print("-" * 50)
-    skip_choice = input("➔ 챕터명 및 챕터 그룹을 번역에서 제외하시겠습니까? (y/n, 기본 y): ").strip().lower()
-    skip_chapters = False if skip_choice == 'n' else True
+    menu_items = list(LANG_MENU.items())
+    for i in range(0, len(menu_items), 3):
+        row_str = ""
+        for j in range(3):
+            if i + j < len(menu_items):
+                num, (name, code) = menu_items[i + j]
+                row_str += f"{num:><2}. {name}({code})".ljust(18)
+        print(row_str)
+    print("16. 직접 언어 코드 입력하기")
+    print("-" * 50)
 
-    translator = None
-    max_batch_chars = 4000
-    llm_lang_map = {'en': 'english', 'ko': 'korean', 'ja': 'japanese', 'zh': 'chinese'}
+    choice = input(f"➔ 선택 (기본값번호/코드 입력 가능, 기본 {default_code}): ").strip().lower()
+    if not choice: return default_code
+    if choice in LANG_MENU: return LANG_MENU[choice][1]
+    if choice == "16":
+        direct_code = input("➔ 언어 코드를 직접 입력하세요 (예: fr_fr): ").strip().lower()
+        return direct_code if direct_code else default_code
+    return choice.replace("-", "_")
 
-    if choice == '1':
-        print(f"\n➔ Google 번역기 세팅 ({src_lang} -> {dest_lang})")
-        translator = GoogleTranslator(source=src_lang, target=dest_lang)
-        max_batch_chars = 4000
-    elif choice == '2':
-        print(f"\n➔ Naver Papago 세팅 ({src_lang} -> {dest_lang})")
-        client_id = load_or_request_api_key("PAPAGO_CLIENT_ID", "Papago Client ID")
-        client_secret = load_or_request_api_key("PAPAGO_CLIENT_SECRET", "Papago Client Secret")
-        translator = PapagoTranslator(client_id=client_id, secret_key=client_secret, source=src_lang, target=dest_lang)
-        max_batch_chars = 4000
-    elif choice == '3':
-        print(f"\n➔ OpenAI ChatGPT 세팅 ({src_lang} -> {dest_lang})")
-        openai_key = load_or_request_api_key("OPENAI_API_KEY", "OpenAI API Secret Key")
-        s_full = llm_lang_map.get(src_lang, src_lang)
-        d_full = llm_lang_map.get(dest_lang, dest_lang)
-        translator = ChatGptTranslator(api_key=openai_key, source=s_full, target=d_full)
-        max_batch_chars = 2500
-    else:
-        print("올바른 번역기를 선택하지 않아 프로그램을 종료합니다.")
-        return
 
-    lang_code_pattern = re.compile(r'^[a-zA-Z]{2}(_[a-zA-Z]{2})?\.snbt$')
+def get_final_lang_code(dest_lang):
+    target_code = dest_lang.lower().replace("-", "_")
+    return MC_FULL_CODE_MAP.get(target_code, target_code)
 
-    tasks_to_run = []
-    for root, dirs, files in os.walk(input_folder):
+
+def load_or_setup_launcher_paths():
+    config_paths = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    config_paths = loaded
+        except Exception:
+            config_paths = {}
+
+    updated = False
+    final_paths = {}
+
+    print("\n🔍 런처 디렉터리 동기화 및 경로 파악 중...")
+    print("-" * 60)
+
+    for name, default_path in DEFAULT_LAUNCHER_PATHS.items():
+        if name in config_paths and config_paths[name] and os.path.exists(config_paths[name]):
+            final_paths[name] = config_paths[name]
+            print(f"[설정 로드] {name} 사용자 정의 경로 연결: {final_paths[name]}")
+            continue
+
+        if os.path.exists(default_path):
+            final_paths[name] = default_path
+            print(f"[자동 감지] {name} 기본 디렉터리 식별: {final_paths[name]}")
+            continue
+
+    return final_paths
+
+
+def find_modpacks_deep(launcher_paths):
+    modpack_list = []
+    for name, base_path in launcher_paths.items():
+        if not os.path.exists(base_path):
+            continue
+
+        print(f"📂 [{name}] 인스턴스 스캔 시작: {base_path}")
+        try:
+            for folder in os.listdir(base_path):
+                pack_root_candidate = os.path.join(base_path, folder)
+                if not os.path.isdir(pack_root_candidate):
+                    continue
+
+                prism_config_path = os.path.join(pack_root_candidate, "minecraft", "config")
+                standard_config_path = os.path.join(pack_root_candidate, "config")
+                dot_mc_config_path = os.path.join(pack_root_candidate, ".minecraft", "config")
+
+                actual_config = None
+                actual_root = None
+
+                if os.path.exists(prism_config_path):
+                    actual_config = prism_config_path
+                    actual_root = os.path.join(pack_root_candidate, "minecraft")
+                elif os.path.exists(standard_config_path):
+                    actual_config = standard_config_path
+                    actual_root = pack_root_candidate
+                elif os.path.exists(dot_mc_config_path):
+                    actual_config = dot_mc_config_path
+                    actual_root = os.path.join(pack_root_candidate, ".minecraft")
+
+                if actual_config and actual_root:
+                    if not any(p['root_path'] == actual_root for p in modpack_list):
+                        modpack_list.append({
+                            "launcher": name, "name": folder, "root_path": actual_root, "config_path": actual_config
+                        })
+        except Exception as e:
+            print(f"[경고] {name} 스캔 중 오류: {e}")
+    return modpack_list
+
+
+def parse_target_localization_files(config_path, root_path, src_lang, final_lang_code):
+    """FTB Skies 2 등 대형 모드팩 구조에 맞춰 탐색 영역 및 필터를 대폭 강화한 추적 엔진"""
+    tasks = []
+
+    # config 뿐만 아니라 모드팩 최상위 폴더(root_path) 전체를 대상으로 정밀 수집을 진행합니다.
+    search_base = root_path if os.path.exists(root_path) else config_path
+    print(f"➔ 🔍 번역 대상 리소스 정밀 분석 중 (기반 경로: {search_base})...")
+
+    for root, dirs, files in os.walk(search_base):
+        root_lower = root.lower()
+
+        # 임시 빌드나 출력 폴더는 탐색에서 무조건 제외
+        if "temp_build" in root_lower or "output" in root_lower:
+            continue
+
+        # 1. FTB Quests 구조 식별 강화
+        if "ftbquests" in root_lower or "quests" in root_lower:
+            for file in files:
+                file_ext_lower = os.path.splitext(file)[1].lower()
+                # 퀘스트 데이터용 파일들 전부 확보
+                if file_ext_lower in ['.snbt', '.json']:
+                    full_input_path = os.path.join(root, file)
+                    rel_path_from_mc = os.path.relpath(full_input_path, root_path)
+                    tasks.append({
+                        'input_path': full_input_path, 'output_rel_path': rel_path_from_mc,
+                        'display_name': f"Quests/{os.path.basename(file)}", 'ext': file_ext_lower, 'is_quest': True
+                    })
+            continue
+
+        # 2. 다국어 자원 폴더 (.json 언어 코드 형태 매핑 - 대소문자 무시 보완)
         for file in files:
-            if file.endswith('.snbt'):
+            file_lower = file.lower()
+            if file_lower.endswith('.json') and LANG_FILE_PATTERN.match(file_lower):
                 full_input_path = os.path.join(root, file)
-                rel_dir = os.path.relpath(root, input_folder)
+                base_name_no_ext = os.path.splitext(file_lower)[0]
 
-                if lang_code_pattern.match(file):
-                    new_file_name = f"{dest_lang}_{dest_lang.lower()}.snbt" if len(
-                        dest_lang) == 2 else f"{dest_lang}.snbt"
-                else:
-                    new_file_name = file
+                # 원본 언어가 en_us 혹은 en이거나 파일명 자체에 언어 코드가 매칭될 때
+                if base_name_no_ext in [src_lang.lower(), "en_us", "en_kr"]:
+                    rel_path_from_mc = os.path.relpath(full_input_path, root_path)
 
-                if rel_dir == '.':
-                    full_output_path = os.path.join(output_folder, new_file_name)
-                else:
-                    full_output_path = os.path.join(output_folder, rel_dir, new_file_name)
+                    # 목적지 언어 파일 확인 (ko_kr.json / ko_KR.json 둘 다 대응)
+                    target_lang_filename = f"{final_lang_code}.json"
+                    pre_translated_file_path = os.path.join(root, target_lang_filename)
 
-                tasks_to_run.append({
-                    'input_path': full_input_path,
-                    'output_path': full_output_path,
-                    'display_name': os.path.join(rel_dir, file) if rel_dir != '.' else file
-                })
+                    # 대문자 버전도 추가 검사 (예: ko_KR.json)
+                    if not os.path.exists(pre_translated_file_path):
+                        alt_filename = f"{final_lang_code.split('_')[0]}_{final_lang_code.split('_')[1].upper()}.json" if '_' in final_lang_code else target_lang_filename
+                        alt_path = os.path.join(root, alt_filename)
+                        if os.path.exists(alt_path):
+                            pre_translated_file_path = alt_path
 
-    if not tasks_to_run:
-        print(f"\n[안내] '{input_folder}' 폴더 안에 .snbt 파일이 없습니다.")
-        return
+                    existing_translations = {}
+                    if os.path.exists(pre_translated_file_path):
+                        try:
+                            with open(pre_translated_file_path, 'r', encoding='utf-8') as pf:
+                                existing_translations = json.load(pf)
+                            print(
+                                f"✨ [기번역 자동 연동] '{os.path.basename(root)}/{os.path.basename(pre_translated_file_path)}' 병합 로드 완료.")
+                        except Exception:
+                            existing_translations = {}
 
-    print(f"\n총 {len(tasks_to_run)}개의 파일을 찾았습니다. 배칭 처리를 시작합니다.\n")
+                    tasks.append({
+                        'input_path': full_input_path, 'output_rel_path': rel_path_from_mc,
+                        'display_name': os.path.relpath(full_input_path,
+                                                        config_path) if config_path in full_input_path else rel_path_from_mc,
+                        'ext': '.json', 'is_quest': False, 'existing_translations': existing_translations
+                    })
 
-    for task in tasks_to_run:
-        process_file_batch(
-            task['input_path'],
-            task['output_path'],
-            task['display_name'],
-            translator,
-            max_batch_chars,
-            skip_chapters
-        )
-        print("-" * 50)
-
-    print("\n" + "=" * 60)
-    print(f"모든 파일의 배치 번역이 완료되어 '{output_folder}' 폴더에 저장되었습니다!")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+    print(f"✅ 필터링 완료: 총 {len(tasks)}개의 유효 번역 자원 파일을 확보했습니다.")
+    return tasks

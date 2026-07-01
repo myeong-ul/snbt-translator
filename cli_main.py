@@ -6,7 +6,7 @@ import zipfile
 from datetime import datetime
 
 # 분리된 커스텀 처리 모듈 로드
-from utils import (
+from cli_translator import (
     print_progress_bar,
     select_language,
     get_final_lang_code,
