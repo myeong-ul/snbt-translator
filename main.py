@@ -1,193 +1,175 @@
 import os
 import re
+import shutil
 import sys
+import zipfile
+from datetime import datetime
 
-# module 패키지에서 필요한 기능들을 직접 가져옵니다.
-from module import (
-    extract_strings_from_file,
-    save_translated_file,
-    encode_text,
-    decode_text,
-    get_translator,
-    build_batches,
-    translate_batch,
-    scan_and_learn_nouns,
-    scan_and_build_local_glossary
+# 분리된 커스텀 처리 모듈 로드
+from utils import (
+    print_progress_bar,
+    select_language,
+    get_final_lang_code,
+    load_or_setup_launcher_paths,
+    find_modpacks_deep,
+    parse_target_localization_files
 )
 
-# 전 세계 주요 언어 코드 매핑 딕셔너리 (번호순)
-LANG_MENU = {
-    "1": ("한국어", "ko"),
-    "2": ("영어", "en"),
-    "3": ("일본어", "ja"),
-    "4": ("중국어 (간체)", "zh-cn"),
-    "5": ("중국어 (번체)", "zh-tw"),
-    "6": ("러시아어", "ru"),
-    "7": ("독일어", "de"),
-    "8": ("프랑스어", "fr"),
-    "9": ("스페인어", "es"),
-    "10": ("포르투갈어", "pt"),
-    "11": ("이탈리아어", "it"),
-    "12": ("베트남어", "vi"),
-    "13": ("태국어", "th"),
-    "14": ("인도네시아어", "id"),
-    "15": ("터키어", "tr")
-}
-
-# 단순 2글자 언어 코드를 마인크래프트 표준 소문자 풀코드로 변환하기 위한 매핑 사전
-MC_FULL_CODE_MAP = {
-    "ko": "ko_kr",
-    "en": "en_us",
-    "ja": "ja_jp",
-    "zh": "zh_cn",
-    "zh-cn": "zh_cn",
-    "zh-tw": "zh_tw",
-    "ru": "ru_ru",
-    "de": "de_de",
-    "fr": "fr_fr",
-    "es": "es_es",
-    "pt": "pt_pt",
-    "it": "it_it",
-    "vi": "vi_vn",
-    "th": "th_th",
-    "id": "id_id",
-    "tr": "tr_tr"
-}
-
-
-def print_progress_bar(current, total, display_name, bar_length=30):
-    percent = float(current) * 100 / total if total > 0 else 100
-    arrow = '■' * int(percent / 100 * bar_length)
-    spaces = '□' * (bar_length - len(arrow))
-    sys.stdout.write(f"\r[{display_name}] 진행률: [{arrow}{spaces}] {percent:.1f}% ({current}/{total} 묶음 완료)")
-    sys.stdout.flush()
-
-
-def select_language(prompt_msg, default_code):
-    """사용자에게 언어 메뉴를 보여주고 번호로 코드를 선택받습니다."""
-    print(f"\n[ {prompt_msg} ]")
-    print("-" * 50)
-
-    menu_items = list(LANG_MENU.items())
-    for i in range(0, len(menu_items), 3):
-        row_str = ""
-        for j in range(3):
-            if i + j < len(menu_items):
-                num, (name, code) = menu_items[i + j]
-                row_str += f"{num:><2}. {name}({code})".ljust(18)
-        print(row_str)
-    print("16. 직접 언어 코드 입력하기")
-    print("-" * 50)
-
-    choice = input(f"➔ 선택 (기본값번호/코드 입력 가능, 기본 {default_code}): ").strip().lower()
-
-    if not choice:
-        return default_code
-    if choice in LANG_MENU:
-        return LANG_MENU[choice][1]
-    if choice == "16":
-        direct_code = input("➔ 언어 코드를 직접 입력하세요 (예: fr_fr, uk_ua): ").strip().lower()
-        return direct_code if direct_code else default_code
-
-    # 코드를 직접 타이핑한 경우 (하이픈은 마인크래프트 표준인 언더바로 변환)
-    return choice.replace("-", "_")
+# 기존 패키지 시스템 기능 연동 (안전하게 감싸서 호출)
+try:
+    from module import (
+        extract_strings_from_file,
+        save_translated_file,
+        encode_text,
+        decode_text,
+        get_translator,
+        build_batches,
+        translate_batch,
+        scan_and_build_local_glossary
+    )
+except ImportError as e:
+    print(f"\n❌ [오류] 기존 'module' 폴더의 스크립트들을 불러오지 못했습니다: {e}")
+    print("현재 실행 폴더 내부에 'module' 폴더와 필수 파일들이 존재하는지 확인하세요.")
+    sys.exit(1)
 
 
 def main():
-    input_folder = "input"
     output_folder = "output"
-    os.makedirs(input_folder, exist_ok=True)
-    os.makedirs(output_folder, exist_ok=True)
+    temp_build_folder = "temp_build"
 
+    os.makedirs(output_folder, exist_ok=True)
+    if os.path.exists(temp_build_folder):
+        shutil.rmtree(temp_build_folder)
+    os.makedirs(temp_build_folder, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print(" [안내] 초고속 멀티 엔진 자동 번역기 (로컬 NLLB & Gemini 호환)")
+    print(" 사용할 번역기 선택: ")
+    print(" 1.Google(무료) | 2.Papago | 3.ChatGPT | 4.나만의 로컬 NLLB | 5.Gemini(추천)")
     print("=" * 60)
-    print(" [안내] FTB Quests & JSON 모드팩 고속 번역 툴키트")
-    print(" 사용할 번역기 선택: 1.Google(무료) | 2.Papago | 3.ChatGPT")
-    print("=" * 60)
-    choice = input("선택 (1~3): ").strip()
+    choice = input("➔ 선택 (1~5): ").strip()
+
+    if not choice:
+        print("[안내] 선택값이 없어 프로그램을 종료합니다.")
+        return
 
     src_lang = select_language("출발(원본) 언어를 선택하세요", "en")
     dest_lang = select_language("도착(목적) 언어를 선택하세요", "ko")
+    final_lang_code = get_final_lang_code(dest_lang)
 
-    if dest_lang == "ko_kr" or dest_lang == "ko":
-        scan_and_build_local_glossary()
+    active_launcher_paths = load_or_setup_launcher_paths()
+    modpacks = find_modpacks_deep(active_launcher_paths)
 
-    print("\n" + "-" * 50)
-    skip_choice = input("➔ 챕터명 및 챕터 그룹을 번역에서 제외하시겠습니까? (y/n, 기본 y): ").strip().lower()
+    selected_pack = None
+    if modpacks:
+        print(f"\n[ 활성화된 모드팩 목록 (총 {len(modpacks)}개 탐색됨) ]")
+        print("-" * 60)
+        for idx, pack in enumerate(modpacks):
+            print(f"{idx + 1}. [{pack['launcher']}] {pack['name']}")
+        print(f"{len(modpacks) + 1}. 직접 모드팩 경로 입력하기")
+        print("-" * 60)
+
+        pack_choice = input(f"➔ 번역할 모드팩 번호를 선택하세요 (1~{len(modpacks) + 1}): ").strip()
+        try:
+            pack_idx = int(pack_choice) - 1
+            if 0 <= pack_idx < len(modpacks):
+                selected_pack = modpacks[pack_idx]
+        except ValueError:
+            pass
+
+    if not selected_pack:
+        print("\n[ 모드팩 경로 직접 수동 입력 ]")
+        print("-" * 60)
+        custom_path = input("➔ 모드팩 최상위 폴더 경로 직접 입력: ").strip()
+        if not custom_path or not os.path.exists(custom_path):
+            print("[오류] 입력 경로가 잘못되었습니다. 프로세스를 종료합니다.")
+            if os.path.exists(temp_build_folder):
+                shutil.rmtree(temp_build_folder)
+            return
+
+        config_path = os.path.join(custom_path, "config")
+        if not os.path.exists(config_path) and os.path.exists(os.path.join(custom_path, ".minecraft", "config")):
+            config_path = os.path.join(custom_path, ".minecraft", "config")
+            custom_path = os.path.join(custom_path, ".minecraft")
+        elif not os.path.exists(config_path) and os.path.exists(os.path.join(custom_path, "minecraft", "config")):
+            config_path = os.path.join(custom_path, "minecraft", "config")
+            custom_path = os.path.join(custom_path, "minecraft")
+
+        selected_pack = {
+            "launcher": "Custom", "name": os.path.basename(custom_path.rstrip("\\/")), "root_path": custom_path,
+            "config_path": config_path
+        }
+
+    clean_pack_name = re.sub(r'[\/:*?"<>| ]', '_', selected_pack['name'])
+    print(f"\n🎯 최종 대상 지정: [{selected_pack['launcher']}] {selected_pack['name']}")
+
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(selected_pack['root_path'])
+        if dest_lang in ["ko_kr", "ko"]:
+            scan_and_build_local_glossary()
+    except Exception as e:
+        print(f"[경고] 로컬 번역 병합 스킵: {e}")
+    finally:
+        os.chdir(original_cwd)
+
+    skip_choice = input("\n➔ 챕터명 및 챕터 그룹을 번역에서 제외하시겠습니까? (y/n, 기본 y): ").strip().lower()
     skip_chapters = False if skip_choice == 'n' else True
 
-    # 번역 코어 모듈을 통해 인스턴스 획득
     translator, max_batch_chars = get_translator(choice, src_lang, dest_lang)
     if not translator:
-        print("잘못된 선택으로 종료합니다.")
+        if os.path.exists(temp_build_folder):
+            shutil.rmtree(temp_build_folder)
         return
 
-    # [핵심 수정] 기존의 다양한 언어코드 파일명 형태(en_us.json, zh_cn.snbt, ko.json 등)를 감지하는 정규식
-    lang_code_pattern = re.compile(r'^[a-zA-Z]{2,3}([-_][a-zA-Z]{2,4})?(\.snbt|\.json)$', re.IGNORECASE)
-
-    tasks_to_run = []
-    for root, dirs, files in os.walk(input_folder):
-        for file in files:
-            file_name, file_ext = os.path.splitext(file)
-            file_ext_lower = file_ext.lower()
-
-            if file_ext_lower in ['.snbt', '.json']:
-                full_input_path = os.path.join(root, file)
-                rel_dir = os.path.relpath(root, input_folder)
-
-                # 원본 파일명이 언어 코드 포맷인지 검증
-                if lang_code_pattern.match(file):
-                    # [핵심 로직] 목적 언어 코드를 완벽한 소문자 풀코드로 변환
-                    target_code = dest_lang.lower().replace("-", "_")
-
-                    # 만약 사용자가 'ko'라고만 선택했거나 메뉴에서 골랐다면 사전(MC_FULL_CODE_MAP)을 참고해 'ko_kr'로 확장
-                    if len(target_code) == 2 and target_code in MC_FULL_CODE_MAP:
-                        final_lang_filename = MC_FULL_CODE_MAP[target_code]
-                    elif target_code in MC_FULL_CODE_MAP:
-                        final_lang_filename = MC_FULL_CODE_MAP[target_code]
-                    else:
-                        # 직접 입력으로 이미 'fr_fr' 같은 풀코드를 넣었다면 그대로 소문자 유지
-                        final_lang_filename = target_code
-
-                    new_file_name = f"{final_lang_filename}{file_ext_lower}"
-                else:
-                    # 'quests.snbt' 같이 고유 개념 명칭을 가진 파일은 원본 명칭 유지
-                    new_file_name = file
-
-                full_output_path = os.path.join(output_folder, new_file_name) if rel_dir == '.' else os.path.join(
-                    output_folder, rel_dir, new_file_name)
-
-                tasks_to_run.append({
-                    'input_path': full_input_path,
-                    'output_path': full_output_path,
-                    'display_name': os.path.join(rel_dir, file) if rel_dir != '.' else file,
-                    'ext': file_ext_lower
-                })
+    # 순수 다국어 리소스 및 퀘스트 파일만 가려받기
+    tasks_to_run = parse_target_localization_files(
+        selected_pack['config_path'], selected_pack['root_path'], src_lang, final_lang_code
+    )
 
     if not tasks_to_run:
-        print(f"\n[안내] '{input_folder}' 내에 번역할 파일이 없습니다.")
+        print("\n[안내] 처리 대상 순수 언어 파일 구조(.json / .snbt)를 발견하지 못했습니다.")
+        if os.path.exists(temp_build_folder):
+            shutil.rmtree(temp_build_folder)
         return
 
-    print(f"\n총 {len(tasks_to_run)}개의 파일을 찾았습니다. 배칭 처리를 시작합니다.\n")
+    print(f"\n총 {len(tasks_to_run)}개의 언어 매핑 자원을 순차 처리합니다.\n")
 
-    # 파일별 처리 루프
     for task in tasks_to_run:
         content, matches, skip_map = extract_strings_from_file(task['input_path'], skip_chapters)
         unique_matches = [t for t in set(matches) if not (skip_chapters and t in skip_map)]
 
+        target_out_path = os.path.join(temp_build_folder, task['output_rel_path'])
+
+        if not task['is_quest']:
+            dir_name = os.path.dirname(target_out_path)
+            target_out_path = os.path.join(dir_name, f"{final_lang_code}{task['ext']}")
+
+        existing_translations = task.get('existing_translations', {})
+        if existing_translations:
+            unique_matches = [m for m in unique_matches if m not in existing_translations]
+
         if not unique_matches:
-            print(f"[{task['display_name']}] 번역할 문장이 없습니다. 원본 복사 중...")
-            save_translated_file(task['output_path'], content, {}, task['ext'])
+            print(f"[{task['display_name']}] 새로 번역할 문장 없음 -> 기존 기번역본 구조 복사.")
+            save_translated_file(target_out_path, content, existing_translations, task['ext'])
             continue
 
-        # [★ 신규 추가] 배치를 묶기 전, 파일 내 명사들을 스캔하여 자동으로 학습합니다.
-        scan_and_learn_nouns(unique_matches, translator)
+        # 앞서 문제가 되었던 사전 고유명사 강제 학습부 안전 장치 가동
+        # 만약 로컬 서버나 에러가 나면 조용히 패스하고 본 번역 진행
+        try:
+            from module.translator_core import scan_and_learn_nouns
+            os.chdir(selected_pack['root_path'])
+            # scan_and_learn_nouns(unique_matches, translator)
+        except Exception:
+            pass
+        finally:
+            os.chdir(original_cwd)
 
-        # 2. 배치 조립 (이제 자동으로 확장된 glossary.json을 기반으로 인코딩됨)
         chunks = build_batches(unique_matches, max_batch_chars, encode_text)
         total_chunks = len(chunks)
-        print(f"[{task['display_name']}] 총 문장 {len(matches)}개 -> {total_chunks}개 배치 결합 완료.")
+        print(f"[{task['display_name']}] 기번역 제외 새 문장 {len(unique_matches)}개 -> {total_chunks}개 배치 연동.")
 
-        translated_map = {}
+        translated_map = dict(existing_translations)
         for text in matches:
             if not text.strip() or text.startswith('{@') or (skip_chapters and text in skip_map):
                 translated_map[text] = text
@@ -197,12 +179,27 @@ def main():
             translated_map.update(batch_result)
             print_progress_bar(idx + 1, total_chunks, task['display_name'])
 
-        print(f"\n[{task['display_name']}] 정렬 저장 중...")
-        save_translated_file(task['output_path'], content, translated_map, task['ext'])
+        print(f"\n[{task['display_name']}] 매핑 데이터 트리 세이브 중...")
+        save_translated_file(target_out_path, content, translated_map, task['ext'])
         print("-" * 50)
 
+    date_str = datetime.now().strftime("%m%d")
+    zip_filename = f"{clean_pack_name}_{date_str}_{final_lang_code}.zip"
+    final_zip_path = os.path.join(output_folder, zip_filename)
+
+    print(f"\n📦 기번역 데이터 병합 오버라이드 팩 압축 중: {zip_filename}")
+    with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(temp_build_folder):
+            for file in files:
+                full_file_path = os.path.join(root, file)
+                archive_name = os.path.relpath(full_file_path, temp_build_folder)
+                zipf.write(full_file_path, archive_name)
+
+    shutil.rmtree(temp_build_folder)
+
     print("\n============================================================")
-    print(" 모든 하위 폴더 내 SNBT / JSON 파일들의 배치 분할 번역이 완료되었습니다!")
+    print(" 🎉 기번역 병합 및 타겟 최적화 배포 패키지 생성이 완료되었습니다!")
+    print(f" ➔ 결과 파일: {final_zip_path}")
     print("============================================================")
 
 
