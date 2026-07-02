@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -78,6 +79,29 @@ def set_status(text: str, pct: int):
         STATUS_INFO["text"] = text
         STATUS_INFO["pct"] = pct
 
+
+LAST_HEARTBEAT_TIME = time.time()
+
+
+@app.post("/api/heartbeat")
+def receive_heartbeat():
+    """프론트엔드로부터 생존 신호를 받습니다."""
+    global LAST_HEARTBEAT_TIME
+    LAST_HEARTBEAT_TIME = time.time()
+    return {"status": "alive"}
+
+
+def _monitor_browser_closed():
+    """브라우저가 닫혔는지 주기적으로 감지하여 서버를 자동 종료합니다."""
+    global LAST_HEARTBEAT_TIME
+    while True:
+        time.sleep(2)  # 2초마다 체크
+        # 마지막 신호 이후 5초 이상 응답이 없으면 모든 브라우저 창이 닫힌 것으로 간주
+        if time.time() - LAST_HEARTBEAT_TIME > 5:
+            print("🔌 모든 브라우저 탭이 닫힘을 감지했습니다. API 서버를 종료합니다.")
+
+            # uvicorn 서버와 프로세스를 안전하게 종료
+            os._exit(0)
 
 @app.get("/api/initial-data")
 def get_initial_data():
@@ -353,16 +377,15 @@ def start_translation(req: TranslationRequest, background_tasks: BackgroundTasks
     return {"status": "started"}
 
 
-from pathlib import Path
-
 if __name__ == "__main__":
     import uvicorn
+    from pathlib import Path
 
-    # pathlib을 사용하면 OS 상관없이 알아서 file:/// 꼴의 정식 URL 포맷으로 변환해 줍니다.
+    # 서버 기동과 동시에 감시 스레드 가동
+    threading.Thread(target=_monitor_browser_closed, daemon=True).start()
+
     html_file_path = Path(__file__).parent / "index.html"
-    html_url = html_file_path.resolve().as_uri()  # 예: file:///C:/Users/.../index.html
+    html_url = html_file_path.resolve().as_uri()
 
     threading.Timer(1.5, lambda: webbrowser.open(html_url)).start()
-
-    # 로컬 호스트 API 서버 오픈
     uvicorn.run(app, host="127.0.0.1", port=18443)
