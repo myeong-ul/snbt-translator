@@ -1,15 +1,18 @@
+import base64
 import json
 import os
 import re
 import shutil
 import sys
 import threading
-import time
+import webbrowser
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-# HTML GUI 브릿지 라이브러리
-import webview
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # 기존 모듈 및 설정 변수 로드
 from cli_translator import (
@@ -36,290 +39,330 @@ except ImportError as e:
     print(f"❌ [오류] 'module' 패키지를 로드할 수 없습니다: {e}")
     sys.exit(1)
 
+app = FastAPI(title="Minecraft Translation Backend Server")
 
-class WebGUIBridge:
-    """HTML/JS(프론트엔드)와 Python(백엔드) 간의 실시간 데이터 연동을 담당하는 브릿지 클래스"""
+# 크롬 브라우저(프론트엔드 HTML)에서 들어오는 요청을 허용하기 위한 CORS 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def __init__(self):
-        self.window = None
-        self.config_data = {}
-        self.modpacks_data = []
+# 글로벌 상태 관리 객체 (실시간 로그 및 진행률 전송용)
+STATUS_INFO = {"text": "대기 중...", "pct": 0, "logs": [], "complete": False, "zip_filename": "", "b64_data": ""}
+STATUS_LOCK = threading.Lock()
+MODPACKS_CACHE = []
 
-    def log_to_html(self, message):
-        """웹 UI 콘솔창으로 메시지 실시간 전송"""
-        if self.window:
-            # 자바스크립트의 안전한 이스케이프 처리를 위해 json.dumps 사용
-            safe_msg = json.dumps(message)
-            self.window.evaluate_js(f"appendLog({safe_msg});")
 
-    def update_status_to_html(self, text, pct=0):
-        """웹 UI 하단 상태바 및 프로그레스바 동기화"""
-        if self.window:
-            safe_text = json.dumps(text)
-            self.window.evaluate_js(f"updateStatus({safe_text}, {pct});")
+class TranslationRequest(BaseModel):
+    src_lang: str
+    dest_lang: str
+    skip_chapters: bool
+    engine_choice: str
+    selected_pack_idx: int
+    api_key: str
+    model_name: str
+    endpoint_url: str
 
-    def init_app(self):
-        """앱 기동 시 HTML 내부로 기존 설정 데이터 및 모드팩 정보 자동 주입"""
-        self.config_data = load_or_setup_launcher_paths()
 
-        # 저장된 엔진 및 키셋 방어선 구축
-        saved_config = {
-            "launcher_paths": {
-                "CurseForge": self.config_data.get("CurseForge", ""),
-                "Prism": self.config_data.get("Prism Launcher", ""),
-                "Modrinth": self.config_data.get("Modrinth App", "")
-            },
-            "saved_engine_choice": self.config_data.get("saved_engine_choice", "1"),
-            "saved_api_key": self.config_data.get("saved_api_key", ""),
-            "saved_model_name": self.config_data.get("saved_model_name", ""),
-            "saved_endpoint_url": self.config_data.get("saved_endpoint_url", "http://192.168.0.35:8000/translate")
-        }
+def add_log(msg: str):
+    print(msg)
+    with STATUS_LOCK:
+        STATUS_INFO["logs"].append(msg)
 
-        # 런처 자동 스캔 진행
+
+def set_status(text: str, pct: int):
+    with STATUS_LOCK:
+        STATUS_INFO["text"] = text
+        STATUS_INFO["pct"] = pct
+
+
+@app.get("/api/initial-data")
+def get_initial_data():
+    """초기 세팅 값 및 검색된 모드팩 리스트를 반환합니다 (Prism / CurseForge 완벽 분기)."""
+    global MODPACKS_CACHE
+    config_data = load_or_setup_launcher_paths()
+    try:
+        MODPACKS_CACHE = find_modpacks_deep(config_data)
+    except Exception:
+        MODPACKS_CACHE = []
+
+    formatted_packs = []
+    for idx, pack in enumerate(MODPACKS_CACHE):
+        version = "1.0.0"
+        # 기본 아이콘 (Dicebear 식별자)
+        icon_src = f"https://api.dicebear.com/7.x/identicon/svg?seed={pack['name']}"
+
+        launcher_type = pack["launcher"].lower()
+        root_path = pack['root_path']
+
+        # 1. Prism Launcher 대응 로직
+        if "prism" in launcher_type:
+            # 📌 버전 추출: instance.cfg 내 ManagedPackVersionName 파싱
+            cfg_path = os.path.join(root_path, "..\instance.cfg")
+            if os.path.exists(cfg_path):
+                try:
+                    with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.startswith("ManagedPackVersionName="):
+                                version = line.split("=", 1)[1].strip()
+                                break
+                except Exception:
+                    pass
+
+            # 📌 아이콘 추출: minecraft/icon.png 가 있으면 Base64 변환하여 프론트 전송
+            icon_path = os.path.join(root_path, "icon.png")
+            if os.path.exists(icon_path):
+                try:
+                    with open(icon_path, "rb") as img_f:
+                        b64_img = base64.b64encode(img_f.read()).decode("utf-8")
+                        icon_src = f"data:image/png;base64,{b64_img}"
+                except Exception:
+                    pass
+
+        # 2. CurseForge Launcher 대응 로직
+        else:
+            manifest_path = os.path.join(root_path, "manifest.json")
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r", encoding="utf-8") as mf:
+                        m_data = json.load(mf)
+                        # manifest.json의 version 필드
+                        version = m_data.get("version", "1.0.0")
+
+                        # 📌 아이콘 추출: manifest.json 내 image 주소 파싱 (기본 필드 확인)
+                        if "image" in m_data and m_data["image"]:
+                            icon_src = m_data["image"]
+                except Exception:
+                    pass
+
+        formatted_packs.append({
+            "index": idx,
+            "launcher": pack["launcher"],
+            "name": pack["name"],
+            "version": version,
+            "icon": icon_src
+        })
+
+    return {
+        "config": {
+            "saved_engine_choice": config_data.get("saved_engine_choice", "1"),
+            "saved_api_key": config_data.get("saved_api_key", ""),
+            "saved_model_name": config_data.get("saved_model_name", ""),
+            "saved_endpoint_url": config_data.get("saved_endpoint_url", "http://192.168.0.35:8000/translate")
+        },
+        "modpacks": formatted_packs
+    }
+
+
+@app.get("/api/status")
+def get_status():
+    """프론트엔드가 실시간 렌더링을 위해 주기적으로 긁어갈(Polling) 상태 엔드포인트"""
+    with STATUS_LOCK:
+        return STATUS_INFO
+
+
+def _bg_translation_pipeline(req: TranslationRequest):
+    global MODPACKS_CACHE
+    try:
+        with STATUS_LOCK:
+            STATUS_INFO["logs"] = []
+            STATUS_INFO["complete"] = False
+            STATUS_INFO["b64_data"] = ""
+
+        config_data = load_or_setup_launcher_paths()
+        config_data["saved_engine_choice"] = req.engine_choice
+        config_data["saved_api_key"] = req.api_key
+        config_data["saved_model_name"] = req.model_name
+        config_data["saved_endpoint_url"] = req.endpoint_url
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=4)
+
+        pack_info = MODPACKS_CACHE[req.selected_pack_idx]
+
+        # env 파일 셋업
+        lines = []
+        if req.engine_choice == "2":
+            lines.append(f"PAPAGO_SECRET={req.api_key}\n")
+        elif req.engine_choice == "3":
+            lines.append(f"OPENAI_API_KEY={req.api_key}\n")
+            if req.model_name: lines.append(f"CHATGPT_MODEL={req.model_name}\n")
+        elif req.engine_choice == "5":
+            lines.append(f"GEMINI_API_KEY={req.api_key}\n")
+            if req.model_name: lines.append(f"GEMINI_MODEL={req.model_name}\n")
         try:
-            self.modpacks_data = find_modpacks_deep(self.config_data)
-        except Exception as e:
-            self.modpacks_data = []
-
-        # 웹 프론트엔드로 로드 결과 일괄 전송 초기화
-        if self.window:
-            self.window.evaluate_js(
-                f"onBackendConfigLoaded({json.dumps(saved_config)}, {json.dumps(self.modpacks_data)});")
-
-    def save_config_from_html(self, updated_config_js):
-        """웹 브라우저단에서 키 입력이나 경로 변경 발생 시 실시간 동기화 저장"""
-        try:
-            data = json.loads(updated_config_js)
-            self.config_data["saved_engine_choice"] = data.get("saved_engine_choice", "1")
-            self.config_data["saved_api_key"] = data.get("saved_api_key", "")
-            self.config_data["saved_model_name"] = data.get("saved_model_name", "")
-            self.config_data["saved_endpoint_url"] = data.get("saved_endpoint_url", "")
-
-            # 런처 패스 업데이트
-            paths = data.get("launcher_paths", {})
-            self.config_data["CurseForge"] = paths.get("CurseForge", "")
-            self.config_data["Prism Launcher"] = paths.get("Prism", "")
-            self.config_data["Modrinth App"] = paths.get("Modrinth", "")
-
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config_data, f, ensure_ascii=False, indent=4)
+            with open(ENV_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines)
         except Exception:
             pass
 
-    def browse_folder(self, launcher_key):
-        """웹에서 '변경' 버튼 클릭 시 파이썬 고유 디렉토리 탐색기 오픈"""
-        chosen_dir = self.window.create_file_dialog(webview.FOLDER_DIALOG)
-        if chosen_dir:
-            path_str = os.path.normpath(chosen_dir[0])
-            # 다시 스캔하여 최신 리스트와 함께 경로 반환
-            if launcher_key == "CurseForge":
-                self.config_data["CurseForge"] = path_str
-            elif launcher_key == "Prism":
-                self.config_data["Prism Launcher"] = path_str
-            elif launcher_key == "Modrinth":
-                self.config_data["Modrinth App"] = path_str
+        final_lang_code = get_final_lang_code(req.dest_lang)
+        output_folder = "output"
+        temp_build_folder = "temp_build"
 
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config_data, f, ensure_ascii=False, indent=4)
+        os.makedirs(output_folder, exist_ok=True)
+        if os.path.exists(temp_build_folder): shutil.rmtree(temp_build_folder)
+        os.makedirs(temp_build_folder, exist_ok=True)
 
-            self.modpacks_data = find_modpacks_deep(self.config_data)
-            return json.dumps({"status": "success", "path": path_str, "modpacks": self.modpacks_data})
-        return json.dumps({"status": "cancel"})
+        add_log("=" * 75)
+        add_log(f"🔄 고속 멀티스레딩 엔진 시작 (엔진: {req.engine_choice} | {req.src_lang} -> {req.dest_lang})")
 
-    def start_translation_pipeline(self, request_data_js):
-        """번역 시작 신호를 받으면 백그라운드 스레드로 연산 코어 기동"""
-        req_data = json.loads(request_data_js)
-        threading.Thread(target=self._run_translation_core, args=(req_data,), daemon=True).start()
+        # 📌 [수정 포인트 1] 기번역 학습 단계를 완벽히 방어적으로 격리
+        set_status("⚙️ 초기화 단계: 로컬 기번역 학습 중...", 5)
+        original_cwd = os.getcwd()
 
-    def _run_translation_core(self, req_data):
-        try:
-            src_lang = req_data.get("src_lang", "en")
-            dest_lang = req_data.get("dest_lang", "ko")
-            skip_chapters = req_data.get("skip_chapters", True)
-            choice = req_data.get("engine_choice", "1")
-            selected_idx = req_data.get("selected_pack_idx")
-
-            if selected_idx is None or selected_idx >= len(self.modpacks_data):
-                self.window.evaluate_js("alert('번역 대상 모드팩 인스턴스가 올바르지 않습니다.');")
-                self.window.evaluate_js("toggleUIProcessing(false);")
-                return
-
-            pack_info = self.modpacks_data[selected_idx]
-
-            # api.env 가상 파일 연동 동기화
-            lines = []
-            api_key = self.config_data.get("saved_api_key", "")
-            model_name = self.config_data.get("saved_model_name", "").strip()
-            if choice == "2":
-                lines.append(f"PAPAGO_SECRET={api_key}\n")
-            elif choice == "3":
-                lines.append(f"OPENAI_API_KEY={api_key}\n")
-                if model_name: lines.append(f"CHATGPT_MODEL={model_name}\n")
-            elif choice == "5":
-                lines.append(f"GEMINI_API_KEY={api_key}\n")
-                if model_name: lines.append(f"GEMINI_MODEL={model_name}\n")
+        if req.dest_lang in ["ko_kr", "ko"]:
             try:
-                with open(ENV_FILE, "w", encoding="utf-8") as f:
-                    f.writelines(lines)
-            except Exception:
-                pass
-
-            final_lang_code = get_final_lang_code(dest_lang)
-            output_folder = "output"
-            temp_build_folder = "temp_build"
-
-            os.makedirs(output_folder, exist_ok=True)
-            if os.path.exists(temp_build_folder): shutil.rmtree(temp_build_folder)
-            os.makedirs(temp_build_folder, exist_ok=True)
-
-            self.log_to_html("=" * 75)
-            self.log_to_html(f"🔄 웹 제어 엔진 연동 완수 -> 번역 파이프라인 기동 (엔진: {choice} | {src_lang} -> {dest_lang})")
-
-            # 1. 로컬 기번역 기계학습
-            self.update_status_to_html("⚙️ 초기화 단계: 로컬 기번역 사전 탐색 및 학습 중...", 3)
-            original_cwd = os.getcwd()
-            try:
+                add_log(f"🔍 모드팩 루트 탐색 시작: {pack_info['root_path']}")
                 os.chdir(pack_info['root_path'])
-                if dest_lang in ["ko_kr", "ko"]: scan_and_build_local_glossary()
+
+                # 만약 이 함수가 무겁다면 타임아웃이나 예외 발생 시 스킵되도록 조치
+                scan_and_build_local_glossary()
+                add_log("✅ 로컬 기번역 데이터 학습 완료.")
             except Exception as e:
-                self.log_to_html(f"[경고] 로컬 번역 병합 스킵: {e}")
+                add_log(f"[경고] 기번역 학습 중 에러가 발생하여 스킵합니다 (에러: {e})")
             finally:
-                os.getcwd(); os.chdir(original_cwd)
+                os.chdir(original_cwd)  # 어떤 일이 있어도 작업 디렉토리는 원복
+        else:
+            add_log("ℹ️ 대상 언어가 한국어가 아니므로 기번역 데이터 학습을 건너뜁니다.")
 
-            # 2. 엔진 인스턴스 핸들링
-            if choice == "4" and self.config_data.get("saved_endpoint_url", "").strip():
-                translator, max_batch_chars = get_translator(choice, src_lang, dest_lang)
-                if translator and hasattr(translator, 'endpoint'):
-                    translator.endpoint = self.config_data.get("saved_endpoint_url", "").strip()
-            else:
-                translator, max_batch_chars = get_translator(choice, src_lang, dest_lang)
+        # 📌 [수정 포인트 2] 번역 엔진 빌드 및 파일 파싱 시작
+        set_status("🛰️ 번역 엔진 구성 및 파일 탐색 중...", 10)
 
-            if not translator:
-                self.log_to_html("❌ [오류] 번역기 엔진 빌드 실패! 설정을 재조정하세요.")
-                self.update_status_to_html("❌ 엔진 빌드 에러", 0)
-                self.window.evaluate_js("toggleUIProcessing(false);")
-                return
+        translator, max_batch_chars = get_translator(req.engine_choice, req.src_lang, req.dest_lang)
+        if req.engine_choice == "4" and hasattr(translator, 'endpoint'):
+            translator.endpoint = req.endpoint_url.strip()
 
-            # 3. 타겟 자원 파일 파싱
-            tasks_to_run = parse_target_localization_files(pack_info['config_path'], pack_info['root_path'], src_lang,
-                                                           final_lang_code)
-            if not tasks_to_run:
-                self.log_to_html("ℹ️ 처리 가능한 유효 언어 리소스 파일(.json / .snbt)이 검출되지 않았습니다.")
-                if os.path.exists(temp_build_folder): shutil.rmtree(temp_build_folder)
-                self.update_status_to_html("ℹ️ 번역 대상 리소스 없음", 100)
-                self.window.evaluate_js("toggleUIProcessing(false);")
-                return
+        if not translator:
+            add_log("❌ [오류] 번역기 엔진 빌드 실패!")
+            set_status("❌ 엔진 빌드 실패", 0)
+            return
 
-            self.update_status_to_html("📋 분석 단계: 대량 배치 사전 컴파일 및 청크 계산 중...", 5)
-            prepared_tasks = []
-            total_chunks_count = 0
+        add_log("📂 번역 대상 로컬라이제이션 파일 스캔 중...")
+        tasks_to_run = parse_target_localization_files(pack_info['config_path'], pack_info['root_path'], req.src_lang,
+                                                       final_lang_code)
 
-            for task in tasks_to_run:
-                content, matches, skip_map = extract_strings_from_file(task['input_path'], skip_chapters)
-                unique_matches = [t for t in set(matches) if not (skip_chapters and t in skip_map)]
-                existing_translations = task.get('existing_translations', {})
-                if existing_translations:
-                    unique_matches = [m for m in unique_matches if m not in existing_translations]
+        if not tasks_to_run:
+            add_log("ℹ️ 처리 가능한 유효 언어 자원 파일이 없습니다. (경로 설정을 확인하세요)")
+            set_status("ℹ️ 번역 대상 파일 없음", 0)
+            return
 
-                chunks = build_batches(unique_matches, max_batch_chars, encode_text) if unique_matches else []
-                total_chunks_count += len(chunks)
-                prepared_tasks.append(
-                    {'task': task, 'content': content, 'matches': matches, 'skip_map': skip_map, 'chunks': chunks})
+        add_log(f"📋 총 {len(tasks_to_run)}개의 파일 리소스가 스캔되었습니다. 청크 분할 시작...")
+        prepared_tasks = []
+        total_chunks_count = 0
+        for task in tasks_to_run:
+            content, matches, skip_map = extract_strings_from_file(task['input_path'], req.skip_chapters)
+            unique_matches = [t for t in set(matches) if not (req.skip_chapters and t in skip_map)]
+            if task.get('existing_translations'):
+                unique_matches = [m for m in unique_matches if m not in task['existing_translations']]
+            chunks = build_batches(unique_matches, max_batch_chars, encode_text) if unique_matches else []
+            total_chunks_count += len(chunks)
+            prepared_tasks.append(
+                {'task': task, 'content': content, 'matches': matches, 'skip_map': skip_map, 'chunks': chunks})
 
-            self.log_to_html(f"📦 분석 완료: 총 {len(tasks_to_run)}개 파일에서 [{total_chunks_count}]개의 네트워크 전송 청크 배치가 생성되었습니다.")
-
-            processed_chunks_count = 0
-            start_time = time.time()
-
-            # 4. 핵심 번역 루프 실행
-            for p_idx, p_task in enumerate(prepared_tasks):
+        if total_chunks_count == 0:
+            add_log("ℹ️ 이미 모든 문장이 번역되어 있거나 새롭게 번역할 청크가 없습니다.")
+            # 파일이 아예 안 뽑혀도 빈 압축파일 방지를 위해 기존 파일 그대로 복사 복구 로직 실행
+            for p_task in prepared_tasks:
                 task = p_task['task']
-                content = p_task['content']
-                matches = p_task['matches']
-                skip_map = p_task['skip_map']
-                chunks = p_task['chunks']
-
                 target_out_path = os.path.join(temp_build_folder, task['output_rel_path'])
                 if not task['is_quest']:
-                    dir_name = os.path.dirname(target_out_path)
-                    target_out_path = os.path.join(dir_name, f"{final_lang_code}{task['ext']}")
+                    target_out_path = os.path.join(os.path.dirname(target_out_path), f"{final_lang_code}{task['ext']}")
+                save_translated_file(target_out_path, p_task['content'], task.get('existing_translations', {}),
+                                     task['ext'])
+        else:
+            add_log(f"📦 총 {total_chunks_count}개의 배치가 병렬 큐에 등록되었습니다.")
 
-                existing_translations = task.get('existing_translations', {})
-                if not chunks:
-                    save_translated_file(target_out_path, content, existing_translations, task['ext'])
-                    continue
+        processed_chunks_count = 0
+        max_workers = 2 if req.engine_choice in ["2", "3"] else 6
 
-                self.log_to_html(
-                    f"▶️ [{p_idx + 1}/{len(prepared_tasks)}] {task['display_name']} ({len(chunks)} 청크 처리 시작)")
-                translated_map = dict(existing_translations)
-                for text in matches:
-                    if not text.strip() or text.startswith('{@') or (skip_chapters and text in skip_map):
-                        translated_map[text] = text
+        for p_idx, p_task in enumerate(prepared_tasks):
+            task = p_task['task']
+            content = p_task['content']
+            matches = p_task['matches']
+            skip_map = p_task['skip_map']
+            chunks = p_task['chunks']
 
-                for c_idx, chunk in enumerate(chunks):
-                    batch_result = translate_batch(chunk, translator, decode_text)
-                    translated_map.update(batch_result)
+            target_out_path = os.path.join(temp_build_folder, task['output_rel_path'])
+            if not task['is_quest']:
+                target_out_path = os.path.join(os.path.dirname(target_out_path), f"{final_lang_code}{task['ext']}")
+
+            if not chunks:
+                save_translated_file(target_out_path, content, task.get('existing_translations', {}), task['ext'])
+                continue
+
+            add_log(f"▶️ [{p_idx + 1}/{len(prepared_tasks)}] {task['display_name']} - {len(chunks)}개 청크 병렬 처리")
+            translated_map = dict(task.get('existing_translations', {}))
+            for text in matches:
+                if not text.strip() or text.startswith('{@') or (req.skip_chapters and text in skip_map):
+                    translated_map[text] = text
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_chunk = {
+                    executor.submit(translate_batch, chunk, translator, decode_text): c_idx
+                    for c_idx, chunk in enumerate(chunks)
+                }
+                for future in as_completed(future_to_chunk):
+                    c_idx = future_to_chunk[future]
+                    try:
+                        batch_result = future.result()
+                        translated_map.update(batch_result)
+                    except Exception as e:
+                        add_log(f"   ⚠️ [청크 {c_idx + 1}번 오류]: {e}")
 
                     processed_chunks_count += 1
-                    current_pct = int((processed_chunks_count / max(total_chunks_count, 1)) * 90) + 5  # 5%~95% 구간 할당
+                    pct = int((processed_chunks_count / max(total_chunks_count, 1)) * 85) + 10
+                    set_status(f"⚡ 병렬 고속 번역 중 ({processed_chunks_count}/{total_chunks_count} 완료)", pct)
 
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / processed_chunks_count
-                    eta = int(avg_time * (total_chunks_count - processed_chunks_count))
-                    eta_str = f"| ⏳ 남은시간: 약 {eta // 60}분 {eta % 60}초"
+            save_translated_file(target_out_path, content, translated_map, task['ext'])
 
-                    self.update_status_to_html(
-                        f"⚡ 진행률: {int((processed_chunks_count / total_chunks_count) * 100)}% ({processed_chunks_count}/{total_chunks_count} 청크 전송 완료) {eta_str}",
-                        current_pct)
-                    self.log_to_html(f"   ↳ 청크 처리 중 [{c_idx + 1}/{len(chunks)}] - 전송 완수")
+        set_status("📦 리소스팩 패키징 ZIP 생성 중...", 95)
+        clean_pack_name = re.sub(r'[\/:*?"<>| ]', '_', pack_info['name'])
+        zip_filename = f"{clean_pack_name}_{datetime.now().strftime('%m%d')}_{final_lang_code}.zip"
+        final_zip_path = os.path.join(output_folder, zip_filename)
 
-                save_translated_file(target_out_path, content, translated_map, task['ext'])
+        with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(temp_build_folder):
+                for file in files:
+                    full_p = os.path.join(root, file)
+                    zipf.write(full_p, os.path.relpath(full_p, temp_build_folder))
+        shutil.rmtree(temp_build_folder)
 
-            # 5. 최종 리소스팩 패키징 빌드
-            self.update_status_to_html("📦 100% 번역 완수! 최종 배포 리소스팩(ZIP) 패키징 단계 진입...", 95)
-            clean_pack_name = re.sub(r'[\/:*?"<>| ]', '_', pack_info['name'])
-            date_str = datetime.now().strftime("%m%d")
-            zip_filename = f"{clean_pack_name}_{date_str}_{final_lang_code}.zip"
-            final_zip_path = os.path.join(output_folder, zip_filename)
+        with open(final_zip_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
 
-            self.log_to_html(f"\n📦 후처리 배포 팩 압축 생성 중 -> {zip_filename}")
-            with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(temp_build_folder):
-                    for file in files:
-                        full_p = os.path.join(root, file)
-                        zipf.write(full_p, os.path.relpath(full_p, temp_build_folder))
+        set_status("✅ 완료되었습니다!", 100)
+        add_log(f"🎉 모든 파일 빌드 완료!\n파일명: {zip_filename}")
 
-            shutil.rmtree(temp_build_folder)
-            total_elapsed = time.time() - start_time
+        with STATUS_LOCK:
+            STATUS_INFO["complete"] = True
+            STATUS_INFO["zip_filename"] = zip_filename
+            STATUS_INFO["b64_data"] = b64_data
 
-            self.log_to_html(f"============================================================")
-            self.log_to_html(f"🎉 리소스팩 패키징 완수! 총 {int(total_elapsed // 60)}분 {int(total_elapsed % 60)}초가 소요되었습니다.")
-            self.log_to_html(f"➔ 파일 저장 절대 경로: {os.path.abspath(final_zip_path)}")
-            self.log_to_html(f"============================================================")
+    except Exception as e:
+        add_log(f"\n❌ [치명적 백엔드 에러]: {str(e)}")
+        set_status("❌ 오류로 인하여 중단됨", 0)
 
-            self.update_status_to_html("✅ 모든 작업이 완벽하게 완료되었습니다!", 100)
-            self.window.evaluate_js(f"alert('번역 및 리소스팩 패키징이 성공적으로 끝났습니다!\\n\\n결과물: {zip_filename}');")
-            self.window.evaluate_js("toggleUIProcessing(false);")
 
-        except Exception as e:
-            self.log_to_html(f"\n❌ [오류 발생으로 인한 작업 중단]: {str(e)}")
-            self.update_status_to_html("❌ 번역 파이프라인 중단 에러 발생", 0)
-            self.window.evaluate_js(f"alert('작업 도중 에러가 발생했습니다:\\n{str(e)}');")
-            self.window.evaluate_js("toggleUIProcessing(false);")
+@app.post("/api/start-translation")
+def start_translation(req: TranslationRequest, background_tasks: BackgroundTasks):
+    """번역 프로세스를 메인 스레드와 완전 무관하게 FastAPI 백그라운드 태스크로 넘깁니다."""
+    background_tasks.add_task(_bg_translation_pipeline, req)
+    return {"status": "started"}
 
+
+from pathlib import Path
 
 if __name__ == "__main__":
-    bridge = WebGUIBridge()
-    # 로컬 HTML 파일을 로드하여 런처 구동 창 생성 (기본 크기 지정)
-    window = webview.create_window(
-        title="Minecraft Modpack High-Speed Web Translator",
-        url="index.html",
-        js_api=bridge,
-        width=880,
-        height=800,
-        min_size=(820, 720)
-    )
-    bridge.window = window
+    import uvicorn
 
-    # 윈도우가 완전히 준비되면 초기 구성값 로딩 트리거 기동
-    webview.start(bridge.init_app)
+    # pathlib을 사용하면 OS 상관없이 알아서 file:/// 꼴의 정식 URL 포맷으로 변환해 줍니다.
+    html_file_path = Path(__file__).parent / "index.html"
+    html_url = html_file_path.resolve().as_uri()  # 예: file:///C:/Users/.../index.html
+
+    threading.Timer(1.5, lambda: webbrowser.open(html_url)).start()
+
+    # 로컬 호스트 API 서버 오픈
+    uvicorn.run(app, host="127.0.0.1", port=18443)
