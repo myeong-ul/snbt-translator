@@ -78,11 +78,11 @@ def get_translator(choice, src_lang, dest_lang):
     """
     # 1~3번은 기존 모듈의 코드 흐름 유지 (생략된 기존 논리 연동)
     if choice == "1":
-        return GoogleTranslator(src_lang, dest_lang), 4000
+        return GoogleTranslator(src_lang, dest_lang), 2000
     elif choice == "2":
-        return PapagoTranslator(src_lang, dest_lang), 4000
+        return PapagoTranslator(src_lang, dest_lang), 2000
     elif choice == "3":
-        return ChatGptTranslator(src_lang, dest_lang), 4000
+        return ChatGptTranslator(src_lang, dest_lang), 2000
 
     # ➔ 4번: 새로 생성한 나만의 고속 로컬 NLLB API 서버 연동
     elif choice == "4":
@@ -110,65 +110,86 @@ def get_translator(choice, src_lang, dest_lang):
     return None, 0
 
 
+import time
+
+
 def translate_batch(chunk, translator, decoder_func):
     """
-    chunk 내부의 모든 문장을 하나의 거대한 텍스트로 묶어
-    단 1번의 통신(초고속 배칭)으로 번역을 처리하는 코어 매핑 엔진
+    [안전성 강화 버전]
+    chunk 내부의 문장 개수와 번역 결과물 개수를 실시간 검증하여
+    구분자 깨짐으로 인한 오염 발생 시, 구분자를 강화하여 최대 3회 재요청합니다.
     """
     batch_map = {}
     if not chunk:
         return batch_map
 
-    # 1. 분리된 청크 문장들을 하나의 문자열로 결합 (통신 횟수 1회로 단축)
-    combined_text = DELIMITER.join(chunk)
+    # 기본 구분자 설정 (기존에 정의된 DELIMITER가 있다고 가정, 없을 경우 '\n' 등)
+    # 여기서는 안전을 위해 여러 후보 구분자를 준비합니다.
+    delimiter_candidates = [
+        DELIMITER,  # 1차 시도: 기존 기본 구분자
+        "\n===[LINE]===\n",  # 2차 시도: LLM이 절대 빼먹지 못하는 거대한 경계선
+        " |||| ",  # 3차 시도: 특수 기호 조합
+        "\n\n"  # 4차 시도: 더블 엔터
+    ]
 
-    try:
-        # 2. 번역기 엔진 종류별 호출 규격 방어 및 연동
-        # 클래스 이름 문자열을 확인하여 분기 처리
-        translator_type = translator.__class__.__name__
+    success = False
+    translated_lines = []
+    expected_count = len(chunk)
 
-        if translator_type == "LocalNLLBTranslator":
-            # 내가 만든 로컬 고속 서버용 호출
-            translated_combined = translator.translate(combined_text, src_lang="en", dest_lang="ko")
+    # 최대 3회(후보 구분자 순회) 재요청 루프
+    for attempt, current_delimiter in enumerate(delimiter_candidates):
+        # 1. 현재 선택된 구분자로 문장 결합
+        combined_text = current_delimiter.join(chunk)
 
-        elif translator_type == "GeminiTranslator":
-            # Gemini API용 호출
-            translated_combined = translator.translate(combined_text, src_lang="en", dest_lang="ko")
+        try:
+            translator_type = translator.__class__.__name__
 
-        elif translator_type == "GoogleTranslator":
-            # deep_translator 구글 무료용 호출 (text 인자만 단일 주입)
-            translated_combined = translator.translate(text=combined_text)
-
-        elif translator_type == "PapagoTranslator":
-            # deep_translator 파파고용 호출
-            translated_combined = translator.translate(text=combined_text)
-
-        elif translator_type == "ChatGptTranslator":
-            # deep_translator ChatGPT용 호출
-            translated_combined = translator.translate(text=combined_text)
-
-        else:
-            # 기타 예외 엔진 처리 방어선
-            if hasattr(translator, 'translate'):
+            # 2. 번역기 엔진 호출
+            if translator_type == "LocalNLLBTranslator":
+                translated_combined = translator.translate(combined_text, src_lang="en", dest_lang="ko")
+            elif translator_type == "GeminiTranslator":
+                translated_combined = translator.translate(combined_text, src_lang="en", dest_lang="ko")
+            elif translator_type == "GoogleTranslator":
+                translated_combined = translator.translate(text=combined_text)
+            elif translator_type == "PapagoTranslator":
+                translated_combined = translator.translate(text=combined_text)
+            elif translator_type == "ChatGptTranslator":
                 translated_combined = translator.translate(text=combined_text)
             else:
-                raise AttributeError("지원하지 않는 번역기 인터페이스입니다.")
+                if hasattr(translator, 'translate'):
+                    translated_combined = translator.translate(text=combined_text)
+                else:
+                    raise AttributeError("지원하지 않는 번역기 인터페이스입니다.")
 
-        # 3. 통째로 번역되어 돌아온 문자열을 다시 각각의 문장 라인으로 쪼갬
-        translated_lines = translated_combined.split(DELIMITER)
+            # 3. 번역된 문자열을 현재 사용한 구분자로 분리
+            translated_lines = translated_combined.split(current_delimiter)
 
-        # 4. 원본 인코딩 텍스트와 번역된 텍스트를 다시 1:1 매핑 복원
-        for orig_encoded, trans_encoded in zip(chunk, translated_lines):
-            orig_raw = decoder_func(orig_encoded)
-            trans_raw = decoder_func(trans_encoded.strip())
-            batch_map[orig_raw] = trans_raw
+            # 📌 [핵심 검증 선] 원본 문장 개수와 번역되어 돌아온 문장 개수가 일치하는지 확인
+            if len(translated_lines) == expected_count:
+                success = True
+                break  # 짝이 정확히 맞으면 오염되지 않은 것이므로 즉시 루프 탈출
+            else:
+                print(f"\n⚠️ [데이터 오염 감지] 문장 개수 불일치! (원본: {expected_count}개, 번역: {len(translated_lines)}개)")
+                print(f"🔄 {attempt + 1}차 재요청을 시도합니다. (구분자 변경 교체)")
+                time.sleep(0.5)  # API 과부하 방지 잠시 대기
 
-    except Exception as e:
-        print(f"\n[오류] 배치 초고속 통신 처리 중 실패: {e}")
-        # 오류 발생 시 프로그램이 멈추지 않도록 원문을 그대로 반환하여 롤백 방어
+        except Exception as e:
+            print(f"❌ [배치 통신 실패] 시도 {attempt + 1}번 항목 에러: {e}")
+            time.sleep(0.5)
+
+    # 4. 모든 조치를 취했음에도 끝까지 구분자가 깨져서 개수가 안 맞는 경우 (최후의 방어선)
+    if not success:
+        print(f"🚨 [복구 불가능] 청크 {expected_count}개의 문장이 끝까지 오염되었습니다. 안전을 위해 원문 복구 롤백을 수행합니다.")
         for orig_encoded in chunk:
             orig_raw = decoder_func(orig_encoded)
             batch_map[orig_raw] = orig_raw
+        return batch_map
+
+    # 5. 검증을 통과한 깨끗한 데이터만 1:1 매핑 복원
+    for orig_encoded, trans_encoded in zip(chunk, translated_lines):
+        orig_raw = decoder_func(orig_encoded)
+        trans_raw = decoder_func(trans_encoded.strip())
+        batch_map[orig_raw] = trans_raw
 
     return batch_map
 
@@ -209,7 +230,7 @@ def scan_and_learn_nouns(unique_strings, translator):
         print(f"➔ [자동 용어집] 새롭게 감지된 고유 용어 {len(new_nouns)}개를 사전 학습 중...")
         for noun in new_nouns:
             try:
-                # 단어 단독 번역 요청 후 학습 명부에 기재
+                # todo 배치 생성해서 한번에 요청하기
                 translated_noun = translator.translate(text=noun).strip()
                 # 번역기 이상으로 문장 구분자가 튀었을 때 방어
                 if DELIMITER in translated_noun or len(translated_noun) > len(noun) * 3:

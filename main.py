@@ -307,7 +307,7 @@ def _bg_translation_pipeline(req: TranslationRequest):
             content = p_task['content']
             matches = p_task['matches']
             skip_map = p_task['skip_map']
-            chunks = p_task['chunks']
+            chunks = p_task['chunks']  # [ [encoded_1, encoded_2], ... ]
 
             target_out_path = os.path.join(temp_build_folder, task['output_rel_path'])
             if not task['is_quest']:
@@ -318,29 +318,42 @@ def _bg_translation_pipeline(req: TranslationRequest):
                 continue
 
             add_log(f"▶️ [{p_idx + 1}/{len(prepared_tasks)}] {task['display_name']} - {len(chunks)}개 청크 병렬 처리")
-            translated_map = dict(task.get('existing_translations', {}))
+
+            # 📌 이 파일 전용 결과 맵 생성
+            local_translated_map = dict(task.get('existing_translations', {}))
+
+            # 번역 제외/스킵 대상 원문 그대로 채워두기 (Key는 디코딩된 원문 기준)
             for text in matches:
                 if not text.strip() or text.startswith('{@') or (req.skip_chapters and text in skip_map):
-                    translated_map[text] = text
+                    local_translated_map[text] = text
+
+            # 멀티스레드 완료 결과 수집을 위한 리스트
+            futures = []
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_chunk = {
-                    executor.submit(translate_batch, chunk, translator, decode_text): c_idx
-                    for c_idx, chunk in enumerate(chunks)
-                }
-                for future in as_completed(future_to_chunk):
-                    c_idx = future_to_chunk[future]
+                for chunk in chunks:
+                    # translate_batch는 내부에서 디코딩된 { 원문_raw: 번역문_raw } 딕셔너리를 뱉어냅니다.
+                    future = executor.submit(translate_batch, chunk, translator, decode_text)
+                    futures.append(future)
+
+                # 어떤 스레드가 먼저 끝나든 안전하게 수집
+                for future in as_completed(futures):
                     try:
-                        batch_result = future.result()
-                        translated_map.update(batch_result)
+                        batch_result = future.result()  # { 원문_raw: 번역문_raw } 형태
+
+                        if batch_result and isinstance(batch_result, dict):
+                            # 📌 핵심: 이미 완벽하게 디코딩 복원된 맵이므로 그대로 병합합니다.
+                            local_translated_map.update(batch_result)
+
                     except Exception as e:
-                        add_log(f"   ⚠️ [청크 {c_idx + 1}번 오류]: {e}")
+                        add_log(f"   ⚠️ 청크 번역 결과 수집 중 오류 발생: {e}")
 
                     processed_chunks_count += 1
                     pct = int((processed_chunks_count / max(total_chunks_count, 1)) * 85) + 10
                     set_status(f"⚡ 병렬 고속 번역 중 ({processed_chunks_count}/{total_chunks_count} 완료)", pct)
 
-            save_translated_file(target_out_path, content, translated_map, task['ext'])
+            # 📌 모든 스레드가 완전히 끝나고 local_translated_map 조립이 끝난 상태에서 안전하게 디스크에 기록
+            save_translated_file(target_out_path, content, local_translated_map, task['ext'])
 
         set_status("📦 리소스팩 패키징 ZIP 생성 중...", 95)
         clean_pack_name = re.sub(r'[\/:*?"<>| ]', '_', pack_info['name'])
