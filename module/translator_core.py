@@ -1,17 +1,148 @@
 import os
 import re
 import sys
+import json
+import threading
+import time
+from collections import deque
 
 import requests
 from deep_translator import GoogleTranslator, PapagoTranslator, ChatGptTranslator
 from dotenv import set_key
 
 from module.encoder import load_glossary, save_glossary
+from module.glossary_sync import COMMON_ESSENTIAL_GLOSSARY, DYNAMIC_ITEM_GLOSSARY
+from module.nllb_runtime import DEFAULT_ENDPOINT, ensure_nllb_endpoint, normalize_endpoint
 
 # ➔ 🚨 반드시 이 위치에 아래 구분자 변수가 선언되어 있어야 합니다!
 DELIMITER = "\n[=]\n"
-
 ENV_FILE = "api.env"
+TRANSLATION_CACHE_FILE = "translation_cache.json"
+GOOGLE_REQUESTS_PER_SECOND = 4
+GOOGLE_WINDOW_SECONDS = 1.0
+GOOGLE_MAX_RETRIES = 4
+
+_TRANSLATION_CACHE_LOCK = threading.Lock()
+_TRANSLATION_CACHE = None
+
+_BAD_TRANSLATIONS = {
+    "심판": "심층암",
+    "딮슬레이트": "심층암",
+    "딥슬레이트": "심층암",
+    "깊은 슬레이트": "심층암",
+    "심해판": "심층암",
+    "갈탄 석탄": "갈탄",
+    "조약돌 심층암": "심층암 조약돌",
+    "자갈 심층암": "심층암 조약돌",
+}
+
+
+def _load_translation_cache():
+    global _TRANSLATION_CACHE
+    if _TRANSLATION_CACHE is not None:
+        return _TRANSLATION_CACHE
+    try:
+        with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        _TRANSLATION_CACHE = data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        _TRANSLATION_CACHE = {}
+    return _TRANSLATION_CACHE
+
+
+def _save_translation_cache(cache):
+    temp_path = f"{TRANSLATION_CACHE_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(cache, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, TRANSLATION_CACHE_FILE)
+
+
+def _cache_translations(mapping):
+    global _TRANSLATION_CACHE
+    with _TRANSLATION_CACHE_LOCK:
+        cache = _load_translation_cache()
+        changed = False
+        for source, translated in mapping.items():
+            if source != translated and cache.get(source) != translated:
+                cache[source] = translated
+                changed = True
+        if changed:
+            _save_translation_cache(cache)
+        # 테스트 시 경로를 교체하는 경우에도 현재 로드한 동일 객체를 명시적으로 유지한다.
+        _TRANSLATION_CACHE = cache
+        return cache
+
+
+def _is_rate_limit_error(error):
+    text = str(error).lower()
+    return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+class GoogleRequestQueue:
+    """최근 1초 동안 API 요청을 최대 N개만 허용하는 FIFO 슬라이딩 윈도우 큐."""
+
+    def __init__(self, requests_per_second: int, window_seconds: float = 1.0):
+        self.limit = max(1, requests_per_second)
+        self.window = max(0.1, window_seconds)
+        self._condition = threading.Condition()
+        self._timestamps = deque()
+        self._waiting = 0
+
+    def acquire(self, cancel_event=None, log_func=None) -> float:
+        """요청 순번을 예약하고 실제 API 호출 직전까지 대기한다."""
+        waited = 0.0
+        started_at = time.monotonic()
+        with self._condition:
+            self._waiting += 1
+            try:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("번역 중지 요청")
+                    now = time.monotonic()
+                    while self._timestamps and self._timestamps[0] <= now - self.window:
+                        self._timestamps.popleft()
+                    if len(self._timestamps) < self.limit:
+                        self._timestamps.append(now)
+                        waited = now - started_at
+                        if waited >= 0.01 and log_func:
+                            log_func(
+                                f"[API 큐] Google 요청 승인, {waited:.2f}초 대기 "
+                                f"(최근 {self.window:g}초 제한 {self.limit}회)"
+                            )
+                        return waited
+                    wake_at = self._timestamps[0] + self.window - now
+                    self._condition.wait(timeout=max(0.01, wake_at))
+            finally:
+                self._waiting -= 1
+                self._condition.notify_all()
+
+    def reservation_failed(self):
+        """실제 호출 전 예약이 무효가 되면 슬롯을 즉시 반환한다."""
+        with self._condition:
+            if self._timestamps:
+                self._timestamps.pop()
+            self._condition.notify_all()
+
+
+_GOOGLE_REQUEST_QUEUE = GoogleRequestQueue(GOOGLE_REQUESTS_PER_SECOND, GOOGLE_WINDOW_SECONDS)
+
+
+def _wait_interruptibly(seconds, cancel_event=None):
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("번역 중지 요청")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.1))
+
+
+def _glossary_sort_key(item):
+    """숫자 접미사가 있는 전체 키(X1/X2)를 어간보다 먼저 적용한다."""
+    source = item[0]
+    numeric_suffix = bool(re.search(r"\d+$", source))
+    return (numeric_suffix, len(source), source.lower())
 
 try:
     import google.generativeai as genai
@@ -20,15 +151,17 @@ except ImportError:
 
 
 class LocalNLLBTranslator:
-    def __init__(self, endpoint="http://192.168.0.35:8000/translate"):
-        self.endpoint = endpoint
-        self.lang_map = {"en": "eng_Latn", "ko": "kor_Latn", "ja": "jpn_Jpan", "zh-cn": "zhne_Hans",
+    def __init__(self, endpoint=DEFAULT_ENDPOINT):
+        self.src_lang = "en"
+        self.dst_lang = "ko"
+        self.endpoint = normalize_endpoint(endpoint)
+        self.lang_map = {"en": "eng_Latn", "ko": "kor_Hang", "ja": "jpn_Jpan", "zh-cn": "zho_Hans",
                          "zh-tw": "zho_Hant"}
 
     def translate(self, text, src_lang="en", dest_lang="ko"):
         # 들어오는 인자 순서 방어 코드
         src = self.lang_map.get(src_lang.lower(), src_lang) if isinstance(src_lang, str) else "eng_Latn"
-        tgt = self.lang_map.get(dest_lang.lower(), dest_lang) if isinstance(dest_lang, str) else "kor_Latn"
+        tgt = self.lang_map.get(dest_lang.lower(), dest_lang) if isinstance(dest_lang, str) else "kor_Hang"
 
         payload = {
             "text": text,  # 무식하게 한줄씩 안보내고 \n[=]\n 으로 묶인 거대한 덩어리를 통째로 한 번에 보냄
@@ -36,14 +169,75 @@ class LocalNLLBTranslator:
             "tgt_lang": tgt
         }
         try:
-            response = requests.post(self.endpoint, json=payload, timeout=60)  # 배치 연산 대기시간 60초로 늘림
+            response = requests.post(self.endpoint, json=payload, timeout=180)
             if response.status_code == 200:
-                return response.json().get("translated_text", text)
-            else:
-                return f"[NLLB 에러 {response.status_code}] {text}"
-        except Exception as e:
-            return f"[NLLB 통신 오류: {e}] {text}"
+                data = response.json()
+                if "translated_text" not in data:
+                    raise ValueError("NLLB 응답에 translated_text가 없습니다.")
+                return data["translated_text"]
+            raise RuntimeError(f"NLLB HTTP {response.status_code}: {response.text[:500]}")
+        except requests.RequestException as exc:
+            raise RuntimeError(f"NLLB 서버 통신 실패 ({self.endpoint}): {exc}") from exc
 
+
+class OpenAICompatibleTranslator:
+    def __init__(self, base_url, api_key="", model_name="", provider="API"):
+        self.base_url, self.api_key, self.model_name, self.provider = base_url.rstrip("/"), api_key, model_name, provider
+    def translate(self, text, src_lang="en", dest_lang="ko"):
+        headers={"Content-Type":"application/json"}
+        if self.api_key: headers["Authorization"]=f"Bearer {self.api_key}"
+        prompt=f"Translate from {src_lang} to {dest_lang}. Preserve JSON/SNBT structure and each {DELIMITER!r} separator. Return only translated text.\n\n{text}"
+        r=requests.post(f"{self.base_url}/chat/completions",headers=headers,json={"model":self.model_name,"messages":[{"role":"user","content":prompt}],"temperature":0.1},timeout=180)
+        if r.status_code>=400: raise RuntimeError(f"{self.provider} HTTP {r.status_code}: {r.text[:500]}")
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+class OllamaTranslator(OpenAICompatibleTranslator):
+    def __init__(self): super().__init__(os.getenv("OLLAMA_ENDPOINT","http://127.0.0.1:11434/v1"),"",os.getenv("OLLAMA_MODEL","llama3.1:8b"),"Ollama")
+
+class OpenRouterTranslator(OpenAICompatibleTranslator):
+    def __init__(self, api_key="", model_name=""):
+        super().__init__(
+            os.getenv("OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1"),
+            api_key or os.getenv("OPENROUTER_API_KEY", ""),
+            model_name or os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet"),
+            "OpenRouter",
+        )
+
+class ClaudeTranslator:
+    """Anthropic Claude 공식 API 전용 번역기 (엔드포인트 고정, 입력 불필요)"""
+
+    def __init__(self, api_key="", model_name=""):
+        self.api_key = api_key or os.getenv("CLAUDE_API_KEY", "")
+        self.model_name = model_name or os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+        self.api_url = "https://api.anthropic.com/v1/messages"
+        self.src_lang = "en"
+        self.dst_lang = "ko"
+
+    def translate(self, text, src_lang="en", dest_lang="ko"):
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        prompt = (
+            f"Translate from {src_lang} to {dest_lang}. "
+            f"Preserve JSON/SNBT structure and each {DELIMITER!r} separator. "
+            f"Return only translated text.\n\n{text}"
+        )
+        payload = {
+            "model": self.model_name,
+            "max_tokens": 8192,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        r = requests.post(self.api_url, headers=headers, json=payload, timeout=180)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Claude HTTP {r.status_code}: {r.text[:500]}")
+        data = r.json()
+        content = data.get("content", [])
+        if content and isinstance(content, list):
+            return content[0].get("text", "").strip()
+        raise RuntimeError("Claude 응답에 텍스트가 없습니다.")
 
 class GeminiTranslator:
     """Gemini API (Google AI Studio) 연동 클래스"""
@@ -70,33 +264,47 @@ class GeminiTranslator:
             return f"[Gemini 에러: {e}] {text}"
 
 
-def get_translator(choice, src_lang, dest_lang):
-    """
-    사용자가 선택한 번역기 엔진을 빌드하여 반환합니다.
-    - choice: '1'(구글무료), '2'(파파고), '3'(ChatGPT), '4'(로컬NLLB), '5'(Gemini)
-    - 반환값: (translator_instance, max_batch_chars)
-    """
+def get_translator(
+    choice,
+    src_lang,
+    dest_lang,
+    endpoint=None,
+    cancel_event=None,
+    log_func=None,
+    api_key=None,
+    model_name=None,
+):
+    """번역 엔진을 만들고 NLLB는 주소 준비·자동 설치·기동까지 보장한다."""
+    log = log_func or print
     # 1~3번은 기존 모듈의 코드 흐름 유지 (생략된 기존 논리 연동)
     if choice == "1":
-        return GoogleTranslator(src_lang, dest_lang), 4000
+        return GoogleTranslator(src_lang, dest_lang), 2000
     elif choice == "2":
-        return PapagoTranslator(src_lang, dest_lang), 4000
+        return PapagoTranslator(src_lang, dest_lang), 2000
     elif choice == "3":
-        return ChatGptTranslator(src_lang, dest_lang), 4000
+        return ChatGptTranslator(src_lang, dest_lang), 2000
 
     # ➔ 4번: 새로 생성한 나만의 고속 로컬 NLLB API 서버 연동
     elif choice == "4":
-        endpoint = input("➔ NLLB 서버 주소 입력 (엔터 입력시 http://http://192.168.0.35:8000/translate): ").strip()
-        if not endpoint:
-            endpoint = "http://http://192.168.0.35:8000/translate"
-
+        endpoint = ensure_nllb_endpoint(
+            endpoint,
+            auto_install=True,
+            auto_start=True,
+            cancel_event=cancel_event,
+            log_func=log,
+        )
         translator_instance = LocalNLLBTranslator(endpoint=endpoint)
-        # 로컬 서버이므로 글자 수 제한 트래픽 부담이 적어 배치를 넓게 잡을 수 있습니다.
-        return translator_instance, 4000
+        translator_instance.src_lang = src_lang
+        translator_instance.dst_lang = dest_lang
+    # CPU NLLB는 큰 청크 하나를 180초 안에 끝내기 어렵고, 실패하면 요청 전체를
+        # 다시 계산해야 한다. 작은 청크로 나누면 진행 상황을 잃지 않고 증분 결과를 캐시할 수 있다.
+        nllb_batch_chars = max(500, min(1800, int(os.getenv("SNBT_NLLB_MAX_CHARS", "1200"))))
+        return translator_instance, nllb_batch_chars
 
-        # ➔ 5번: 제미나이(Gemini AI) 공식 API 연동
+    # ➔ 5번: 제미나이(Gemini AI) 공식 API 연동
     elif choice == "5":
-        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             api_key = input("➔ Gemini API Key를 입력하세요: ").strip()
         if not api_key:
@@ -104,72 +312,133 @@ def get_translator(choice, src_lang, dest_lang):
             return None, 0
 
         # 가성비와 속도가 좋은 1.5-flash 모델을 기본값으로 타겟팅합니다.
-        translator_instance = GeminiTranslator(api_key=api_key, model_name="gemini-1.5-flash")
+        gemini_model = model_name or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        translator_instance = GeminiTranslator(api_key=api_key, model_name=gemini_model)
+        translator_instance.src_lang = src_lang
+        translator_instance.dst_lang = dest_lang
+        return translator_instance, 2000
+
+    # ➔ 6번: Ollama (로컬) - 엔드포인트/env 고정, 입력 칸 불필요
+    elif choice == "6":
+        translator_instance = OllamaTranslator()
+        translator_instance.src_lang = src_lang
+        translator_instance.dst_lang = dest_lang
+        return translator_instance, 2000
+
+    # ➔ 7번: OpenRouter - 엔드포인트 고정 (https://openrouter.ai/api/v1)
+    elif choice == "7":
+        translator_instance = OpenRouterTranslator(api_key=api_key, model_name=model_name)
+        translator_instance.src_lang = src_lang
+        translator_instance.dst_lang = dest_lang
+        return translator_instance, 2000
+
+    # ➔ 8번: Claude (Anthropic 공식 API) - 엔드포인트 고정 (https://api.anthropic.com/v1)
+    elif choice == "8":
+        translator_instance = ClaudeTranslator(api_key=api_key, model_name=model_name)
+        translator_instance.src_lang = src_lang
+        translator_instance.dst_lang = dest_lang
         return translator_instance, 2000
 
     return None, 0
 
 
-def translate_batch(chunk, translator, decoder_func):
+def safe_replace(text, eng_word, ko_word):
     """
-    chunk 내부의 모든 문장을 하나의 거대한 텍스트로 묶어
-    단 1번의 통신(초고속 배칭)으로 번역을 처리하는 코어 매핑 엔진
+    한글과 영문이 뒤섞인 문장에서 영문 고유명사만 안전하게 치환하는 함수.
+    \b(단어 경계)를 사용하여 'Coal'이 'Charcoal'이나 'Lignite'를 오염시키지 않도록 방어합니다.
     """
-    batch_map = {}
+    # 영문 단어 대소문자 구분 없이 문장 내에서 독립된 단어일 때만 치환 패턴 생성
+    pattern = re.compile(r'\b' + re.escape(eng_word) + r'\b', re.IGNORECASE)
+    # 치환문을 그대로 넘기면 `re.sub`가 `\\1`, `\\g<...>`, 문자열 끝의 `\\`를
+    # 정규식 치환식으로 해석한다. 콜백을 사용하면 평문 용어의 백슬래시도 보존된다.
+    return pattern.sub(lambda _match: ko_word, text)
+
+def translate_batch(chunk, translator, decoder_func, cancel_event=None, log_func=None):
+    """청크 단위 번역, 캐시 재사용, 제한 재시도 및 결과 후처리를 수행한다."""
     if not chunk:
-        return batch_map
+        return {}
 
-    # 1. 분리된 청크 문장들을 하나의 문자열로 결합 (통신 횟수 1회로 단축)
-    combined_text = DELIMITER.join(chunk)
+    log = log_func or print
+    cache = _load_translation_cache()
+    originals = [decoder_func(value) for value in chunk]
+    missing = [index for index, source in enumerate(originals) if source not in cache]
+    if not missing:
+        log(f"[번역 캐시] API 호출 없이 {len(originals)}개 문장 재사용")
+        return {source: cache[source] for source in originals}
 
-    try:
-        # 2. 번역기 엔진 종류별 호출 규격 방어 및 연동
-        # 클래스 이름 문자열을 확인하여 분기 처리
-        translator_type = translator.__class__.__name__
+    uncached_chunk = [chunk[index] for index in missing]
+    uncached_originals = [originals[index] for index in missing]
+    delimiter_candidates = [DELIMITER]
+    translated_lines = None
+    translator_type = translator.__class__.__name__
+    is_google = translator_type == "GoogleTranslator"
 
-        if translator_type == "LocalNLLBTranslator":
-            # 내가 만든 로컬 고속 서버용 호출
-            translated_combined = translator.translate(combined_text, src_lang="en", dest_lang="ko")
+    for attempt, delimiter in enumerate(delimiter_candidates):
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("번역 중지 요청")
+            combined_text = delimiter.join(uncached_chunk)
+            if is_google:
+                _GOOGLE_REQUEST_QUEUE.acquire(cancel_event, log)
 
-        elif translator_type == "GeminiTranslator":
-            # Gemini API용 호출
-            translated_combined = translator.translate(combined_text, src_lang="en", dest_lang="ko")
+            try:
+                if hasattr(translator, "src_lang") and hasattr(translator, "dst_lang"):
+                    translated_combined = translator.translate(
+                        combined_text,
+                        src_lang=getattr(translator, "src_lang", "en"),
+                        dest_lang=getattr(translator, "dst_lang", "ko"),
+                    )
+                elif hasattr(translator, "translate"):
+                    translated_combined = translator.translate(text=combined_text)
+                else:
+                    raise AttributeError("지원하지 않는 번역기 인터페이스입니다.")
+            except Exception:
+                if is_google:
+                    _GOOGLE_REQUEST_QUEUE.reservation_failed()
+                raise
+            if not isinstance(translated_combined, str):
+                raise TypeError("번역기가 문자열을 반환하지 않았습니다.")
+            lines = translated_combined.split(delimiter)
+            if len(lines) == len(uncached_chunk):
+                translated_lines = lines
+                break
+            raise ValueError(f"문장 수 불일치: 원본 {len(uncached_chunk)}, 번역 {len(lines)}")
+        except InterruptedError:
+            raise
+        except Exception as error:
+            if is_google and _is_rate_limit_error(error):
+                # 슬라이딩 윈도우 큐가 이미 초당 4회를 제한하지만, 서버가 추가 제한을
+                # 적용하면 Retry-After 부재 시 보수적으로 지수 백오프를 적용한다.
+                backoff = min(2 ** (attempt + 1), 16)
+                log(f"[API 제한] 429 감지: {backoff}초 후 동일 청크 큐 재시도")
+                _wait_interruptibly(backoff, cancel_event)
+                continue
 
-        elif translator_type == "GoogleTranslator":
-            # deep_translator 구글 무료용 호출 (text 인자만 단일 주입)
-            translated_combined = translator.translate(text=combined_text)
+            # 전송/서버 오류로 구분자를 바꿔도 해결되지 않는다. 특히 NLLB read timeout을
+            # 구분자별로 네 번 재호출하면 첫 추론이 끝날 때까지 다음 계산까지 누적된다.
+            # 원격 번역 결과의 불일치만 다른 구분자로 재시도하고, 구조적 포맷 오류는 즉시 실패시킨다.
+            if isinstance(error, (requests.RequestException, RuntimeError, TypeError, AttributeError)):
+                raise
+            raise
 
-        elif translator_type == "PapagoTranslator":
-            # deep_translator 파파고용 호출
-            translated_combined = translator.translate(text=combined_text)
+    if translated_lines is None:
+        raise RuntimeError(f"청크 번역 실패 ({len(uncached_chunk)}개 문장)")
 
-        elif translator_type == "ChatGptTranslator":
-            # deep_translator ChatGPT용 호출
-            translated_combined = translator.translate(text=combined_text)
+    translated_map = {}
+    for source, translated_encoded in zip(uncached_originals, translated_lines):
+        translated = decoder_func(translated_encoded.strip())
+        for source_term, target_term in COMMON_ESSENTIAL_GLOSSARY.items():
+            translated = safe_replace(translated, source_term, target_term)
+        for wrong, right in _BAD_TRANSLATIONS.items():
+            translated = translated.replace(wrong, right)
+        if re.search(r"[a-zA-Z]", translated):
+            for source_term, target_term in sorted(DYNAMIC_ITEM_GLOSSARY.items(), key=_glossary_sort_key, reverse=True):
+                translated = safe_replace(translated, source_term, target_term)
+        translated_map[source] = translated
 
-        else:
-            # 기타 예외 엔진 처리 방어선
-            if hasattr(translator, 'translate'):
-                translated_combined = translator.translate(text=combined_text)
-            else:
-                raise AttributeError("지원하지 않는 번역기 인터페이스입니다.")
-
-        # 3. 통째로 번역되어 돌아온 문자열을 다시 각각의 문장 라인으로 쪼갬
-        translated_lines = translated_combined.split(DELIMITER)
-
-        # 4. 원본 인코딩 텍스트와 번역된 텍스트를 다시 1:1 매핑 복원
-        for orig_encoded, trans_encoded in zip(chunk, translated_lines):
-            orig_raw = decoder_func(orig_encoded)
-            trans_raw = decoder_func(trans_encoded.strip())
-            batch_map[orig_raw] = trans_raw
-
-    except Exception as e:
-        print(f"\n[오류] 배치 초고속 통신 처리 중 실패: {e}")
-        # 오류 발생 시 프로그램이 멈추지 않도록 원문을 그대로 반환하여 롤백 방어
-        for orig_encoded in chunk:
-            orig_raw = decoder_func(orig_encoded)
-            batch_map[orig_raw] = orig_raw
-
+    latest_cache = _cache_translations(translated_map)
+    batch_map = {source: latest_cache.get(source, translated_map.get(source, source)) for source in originals}
+    log(f"[테스트 로그] API {len(uncached_originals)}개, 캐시 재사용 {len(originals) - len(uncached_originals)}개")
     return batch_map
 
 def _get_or_prompt_key(key_name, provider_name):
@@ -209,7 +478,7 @@ def scan_and_learn_nouns(unique_strings, translator):
         print(f"➔ [자동 용어집] 새롭게 감지된 고유 용어 {len(new_nouns)}개를 사전 학습 중...")
         for noun in new_nouns:
             try:
-                # 단어 단독 번역 요청 후 학습 명부에 기재
+                # todo 배치 생성해서 한번에 요청하기
                 translated_noun = translator.translate(text=noun).strip()
                 # 번역기 이상으로 문장 구분자가 튀었을 때 방어
                 if DELIMITER in translated_noun or len(translated_noun) > len(noun) * 3:

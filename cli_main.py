@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import zipfile
 from datetime import datetime
 
@@ -14,6 +15,7 @@ from cli_translator import (
     find_modpacks_deep,
     parse_target_localization_files
 )
+from module.nllb_runtime import DEFAULT_ENDPOINT, load_endpoint_setting, normalize_endpoint
 
 # 기존 패키지 시스템 기능 연동 (안전하게 감싸서 호출)
 try:
@@ -46,8 +48,9 @@ def main():
     print(" [안내] 초고속 멀티 엔진 자동 번역기 (로컬 NLLB & Gemini 호환)")
     print(" 사용할 번역기 선택: ")
     print(" 1.Google(무료) | 2.Papago | 3.ChatGPT | 4.나만의 로컬 NLLB | 5.Gemini(추천)")
+    print(" 6.Ollama(로컬) | 7.OpenRouter | 8.Claude")
     print("=" * 60)
-    choice = input("➔ 선택 (1~5): ").strip()
+    choice = input("➔ 선택 (1~8): ").strip()
 
     if not choice:
         print("[안내] 선택값이 없어 프로그램을 종료합니다.")
@@ -107,7 +110,32 @@ def main():
     try:
         os.chdir(selected_pack['root_path'])
         if dest_lang in ["ko_kr", "ko"]:
-            scan_and_build_local_glossary()
+            scan_started = time.monotonic()
+            last_bucket = -1
+
+            def report_scan_progress(current, total, phase):
+                nonlocal last_bucket
+                if phase == "inventory":
+                    print(
+                        f"\r🔍 탐색 범위 계산 중... 확인된 작업 후보 {current:,}개",
+                        end="",
+                        flush=True,
+                    )
+                    return
+                elapsed = max(time.monotonic() - scan_started, 0.001)
+                percent = int((current / total) * 100) if total else 0
+                eta = round((elapsed / current) * (total - current)) if current else None
+                bucket = percent // 10
+                if bucket >= last_bucket:
+                    last_bucket = bucket
+                    print(
+                        f"\r🔍 glossary 탐색 {current:,}/{total:,} ({percent:3d}%)"
+                        f" | 예상 남음 {eta if eta is not None else '계산 중'}초",
+                        end="" if phase == "scanning" else "\n",
+                        flush=True,
+                    )
+
+            scan_and_build_local_glossary(progress_callback=report_scan_progress)
     except Exception as e:
         print(f"[경고] 로컬 번역 병합 스킵: {e}")
     finally:
@@ -116,7 +144,34 @@ def main():
     skip_choice = input("\n➔ 챕터명 및 챕터 그룹을 번역에서 제외하시겠습니까? (y/n, 기본 y): ").strip().lower()
     skip_chapters = False if skip_choice == 'n' else True
 
-    translator, max_batch_chars = get_translator(choice, src_lang, dest_lang)
+    nllb_endpoint = None
+    api_key = None
+    model_name = None
+    if choice == "4":
+        saved_endpoint = load_endpoint_setting() or DEFAULT_ENDPOINT
+        entered_endpoint = input(
+            f"➔ NLLB 주소 (Enter={saved_endpoint}, 로컬 자동 설치/기동): "
+        ).strip()
+        nllb_endpoint = normalize_endpoint(entered_endpoint or saved_endpoint)
+        print(f"ℹ️ NLLB 주소: {nllb_endpoint}")
+    elif choice == "7":
+        api_key = input("➔ OpenRouter API Key: ").strip()
+        model_name = input("➔ OpenRouter 모델명 (기본: anthropic/claude-3.5-sonnet): ").strip()
+    elif choice == "8":
+        api_key = input("➔ Claude API Key: ").strip()
+        model_name = input("➔ Claude 모델명 (기본: claude-3-5-sonnet-20241022): ").strip()
+    elif choice == "6":
+        model_name = input("➔ Ollama 모델명 (기본: llama3.1:8b): ").strip()
+
+    translator, max_batch_chars = get_translator(
+        choice,
+        src_lang,
+        dest_lang,
+        endpoint=nllb_endpoint,
+        log_func=print,
+        api_key=api_key,
+        model_name=model_name,
+    )
     if not translator:
         if os.path.exists(temp_build_folder):
             shutil.rmtree(temp_build_folder)

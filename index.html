@@ -343,6 +343,10 @@
             margin-right: 10px;
         }
 
+        .btn-stop { background: #e74c3c; margin-left: 10px; }
+        .btn-stop:hover { background: #c0392b; }
+        .time-info { color: #888; font-size: 12px; white-space: nowrap; }
+
         .hidden {
             display: none !important;
         }
@@ -395,18 +399,26 @@
             </div>
 
             <div class="panel-main">
-                <h3 style="font-size:14px; font-weight:bold; color:#3498db; margin-bottom:12px;">번역기 엔진 API 선택</h3>
+                <h3 style="font-size:14px; font-weight:bold; color:#3498db; margin-bottom:12px;">번역 엔진 선택</h3>
                 <div class="radio-box-group">
+                    <label class="radio-box-item" style="grid-column:1/-1;background:#1e3040;border-color:#3498db;"><strong>기계번역</strong></label>
                     <label class="radio-box-item"><input checked name="engine" onchange="toggleEngineFields()" type="radio"
                                                          value="1"> Google (무료)</label>
                     <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
                                                          value="2"> Papago</label>
                     <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
+                                                         value="4"> 로컬 NLLB</label>
+                    <label class="radio-box-item" style="grid-column:1/-1;background:#302518;border-color:#e67e22;"><strong>AI 번역</strong></label>
+                    <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
                                                          value="3"> ChatGPT</label>
                     <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
                                                          value="5"> Gemini (추천)</label>
                     <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
-                                                         value="4"> 로컬 NLLB</label>
+                                                         value="6"> Ollama (로컬)</label>
+                    <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
+                                                         value="7"> OpenRouter</label>
+                    <label class="radio-box-item"><input name="engine" onchange="toggleEngineFields()" type="radio"
+                                                         value="8"> Claude</label>
                 </div>
 
                 <div id="setup-dynamic-fields">
@@ -415,12 +427,16 @@
                         <input id="input-api-key" type="password">
                     </div>
                     <div class="form-group id-field-model hidden">
-                        <label>인공지능 모델명 (Model Version)</label>
+                        <label id="lbl-model-name">인공지능 모델명 (Model Version)</label>
                         <input id="input-model-name" type="text">
                     </div>
                     <div class="form-group id-field-url hidden">
-                        <label>로컬 엔드포인트 호스트 엔드 주소 URL</label>
-                        <input id="input-endpoint-url" type="text">
+                        <label id="lbl-endpoint-url">NLLB 서버 주소 (기본: http://127.0.0.1:8000/translate)</label>
+                        <input id="input-endpoint-url" type="text" placeholder="http://127.0.0.1:8000/translate">
+                        <div style="font-size:11px; color:#777; margin-top:5px; line-height:1.5;">
+                            로컬 서버가 없으면 필요한 구성 요소를 자동 설치하고 서버를 자동으로 시작합니다.
+                            다른 PC/서버의 NLLB 주소를 입력하면 해당 서버에 연결합니다.
+                        </div>
                     </div>
                 </div>
 
@@ -445,6 +461,12 @@
                     <input checked id="skip-chapters" style="width:auto;" type="checkbox"> 퀘스트 챕터명 및 시스템 그룹 식별자 번역 제외
                     (추천)
                 </label>
+                <div class="form-group" style="margin-top:18px; padding-top:15px; border-top:1px solid #3d3d3d;">
+                    <label>번역 대상 파일/모드 선택</label>
+                    <input id="selected-mods-filter" type="text" placeholder="모드명 입력 (쉼표로 구분, 비우면 전체)">
+                    <button class="btn btn-back" style="width:100%; margin-top:8px;" onclick="loadTranslationFiles()">📂 파일 목록 불러오기</button>
+                    <div id="translation-file-picker" class="hidden" style="max-height:320px; overflow:auto; margin-top:10px; padding:8px; border:1px solid #444; border-radius:4px;"></div>
+                </div>
             </div>
         </div>
         </div>
@@ -464,12 +486,18 @@
 </div>
 
 <div class="bottom-action-bar hidden" id="global-bottom-bar">
-    <div class="status-info">
-        <div id="status-txt">대기 중...</div>
-        <div class="progress-bg">
-            <div class="progress-bar" id="main-progress"></div>
+        <div class="status-info">
+            <div id="status-txt">대기 중...</div>
+            <div class="progress-bg">
+                <div class="progress-bar" id="main-progress"></div>
+            </div>
         </div>
-    </div>
+        <div class="time-info" id="time-info">실제 소요 시간: 00:00 | 예상 남은 시간: 계산 중...</div>
+        <button class="btn btn-stop hidden" id="stop-translation-btn" onclick="stopTranslation()">⏹ 중지</button>
+        <button class="btn btn-back" id="copy-log-btn" onclick="copyTranslationLog()" style="margin-left:10px; padding:10px 14px;">📋 로그 복사</button>
+        <button class="btn btn-back" id="download-log-btn" onclick="downloadTranslationLog()" style="margin-left:6px; padding:10px 14px;">⬇ 로그 저장</button>
+        <button class="btn btn-back" onclick="saveTranslationSession()" style="margin-left:6px; padding:10px 14px;">💾 세션 저장</button>
+        <button class="btn btn-back" onclick="loadTranslationSession()" style="margin-left:6px; padding:10px 14px;">📂 세션 불러오기</button>
 </div>
 
 <script>
@@ -509,6 +537,7 @@
         } else if (screenId === 'processing') {
             document.getElementById('view-slot').classList.add('full-width');
             document.getElementById('global-bottom-bar').classList.remove('hidden');
+            document.getElementById('stop-translation-btn').classList.remove('hidden');
         } else {
             document.getElementById('view-slot').classList.remove('full-width');
             if (pollingInterval) {
@@ -560,11 +589,84 @@
             document.querySelector('.id-field-model').classList.remove('hidden');
         } else if (choice === "4") {
             document.querySelector('.id-field-url').classList.remove('hidden');
+        } else if (choice === "6") {
+            document.getElementById('lbl-api-key').innerText = "Ollama API 키 (선택):";
+            document.getElementById('lbl-model-name').innerText = "Ollama 모델명:";
+            document.getElementById('lbl-endpoint-url').innerText = "Ollama 엔드포인트:";
+            document.querySelector('.id-field-key').classList.remove('hidden');
+            document.querySelector('.id-field-model').classList.remove('hidden');
+            document.querySelector('.id-field-url').classList.remove('hidden');
+        } else if (choice === "7") {
+            document.getElementById('lbl-api-key').innerText = "OpenRouter API Key:";
+            document.getElementById('lbl-model-name').innerText = "OpenRouter 모델명: (예: anthropic/claude-3.5-sonnet)";
+            document.querySelector('.id-field-key').classList.remove('hidden');
+            document.querySelector('.id-field-model').classList.remove('hidden');
+        } else if (choice === "8") {
+            document.getElementById('lbl-api-key').innerText = "Claude API Key:";
+            document.getElementById('lbl-model-name').innerText = "Claude 모델명: (예: claude-3-5-sonnet-20241022)";
+            document.querySelector('.id-field-key').classList.remove('hidden');
+            document.querySelector('.id-field-model').classList.remove('hidden');
         }
+    }
+
+    async function loadTranslationFiles() {
+        if (selectedPackIdx === null || !backendData) return;
+        const pack = backendData.modpacks[selectedPackIdx];
+        const r = await fetch(`${API_BASE}/api/translation-files?root_path=${encodeURIComponent(pack.root_path)}&src_lang=${document.getElementById('src-lang').value}&dest_lang=${document.getElementById('dest-lang').value}`);
+        const d = await r.json();
+        const box = document.getElementById('translation-file-picker');
+        box.innerHTML = '';
+
+        // 퀘스트 파일과 모드 파일을 분리
+        const questFiles = d.files.filter(f => f.kind === 'quest');
+        const modFiles = d.files.filter(f => f.kind !== 'quest');
+
+        // 공용 버튼 생성 헬퍼
+        function createGroupHeader(title, files, groupClass) {
+            const header = document.createElement('div');
+            header.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 4px;margin-top:8px;border-bottom:1px solid #3d3d3d;';
+            header.innerHTML = `
+                <span style="font-weight:bold;font-size:12px;color:#3498db;flex:1;">${title} <span style="color:#777;font-weight:normal;">(${files.length}개)</span></span>
+                <button type="button" class="btn btn-back" style="padding:3px 10px;font-size:11px;" onclick="setAllChecks('${groupClass}', true)">✅ 전체 선택</button>
+                <button type="button" class="btn btn-back" style="padding:3px 10px;font-size:11px;" onclick="setAllChecks('${groupClass}', false)">⬜ 전체 해제</button>
+            `;
+            return header;
+        }
+
+        function appendFiles(files, groupClass) {
+            files.forEach(f => {
+                const row = document.createElement('label');
+                row.className = groupClass;
+                row.style.cssText = 'display:flex;gap:6px;padding:4px;color:#ddd;font-size:12px;align-items:center;';
+                row.innerHTML = `<input type="checkbox" value="${f.path}" checked style="flex-shrink:0;"> <span style="flex:1;word-break:break-all;">${f.relative_path}</span>`;
+                box.appendChild(row);
+            });
+        }
+
+        if (questFiles.length > 0) {
+            box.appendChild(createGroupHeader('📚 퀘스트 파일', questFiles, 'quest-group'));
+            appendFiles(questFiles, 'quest-group');
+        }
+        if (modFiles.length > 0) {
+            box.appendChild(createGroupHeader('📦 모드 파일', modFiles, 'mod-group'));
+            appendFiles(modFiles, 'mod-group');
+        }
+        if (d.files.length === 0) {
+            box.innerHTML = '<div style="padding:15px;text-align:center;color:#666;">번역 가능한 파일이 없습니다.</div>';
+        }
+
+        box.classList.remove('hidden');
+    }
+
+    function setAllChecks(groupClass, checked) {
+        document.querySelectorAll(`#translation-file-picker .${groupClass} input[type="checkbox"]`).forEach(cb => {
+            cb.checked = checked;
+        });
     }
 
     function runTranslationPipeline() {
         navigateTo('processing');
+        document.getElementById('stop-translation-btn').classList.remove('hidden');
         document.getElementById('console-log-view').classList.remove('hidden');
         document.getElementById('console-log-view').innerText = "";
         document.getElementById('result-success-box').classList.add('hidden');
@@ -577,7 +679,10 @@
             selected_pack_idx: selectedPackIdx,
             api_key: document.getElementById('input-api-key').value,
             model_name: document.getElementById('input-model-name').value,
-            endpoint_url: document.getElementById('input-endpoint-url').value
+            endpoint_url: document.getElementById('input-endpoint-url').value,
+            pack_path: backendData && backendData.modpacks[selectedPackIdx] ? backendData.modpacks[selectedPackIdx].root_path : '',
+            selected_file_paths: Array.from(document.querySelectorAll('#translation-file-picker input:checked')).map(x => x.value),
+            selected_mods: document.getElementById('selected-mods-filter').value.split(',').map(x => x.trim()).filter(Boolean)
         };
 
         // 백엔드 비동기 파이프라인 트리거 요청
@@ -598,6 +703,16 @@
                 // 진행상태 업데이트
                 document.getElementById('status-txt').innerText = status.text;
                 document.getElementById('main-progress').style.width = status.pct + "%";
+                if (status.scan_phase === 'inventory') {
+                    document.getElementById('time-info').innerText =
+                        `로컬 탐색 범위 계산 중 | 확인된 작업 후보: ${Number(status.scan_processed || 0).toLocaleString()}개`;
+                } else if (status.scan_phase === 'scanning') {
+                    document.getElementById('time-info').innerText =
+                        `로컬 탐색: ${Number(status.scan_processed || 0).toLocaleString()}/${Number(status.scan_total || 0).toLocaleString()} (${status.scan_percent || 0}%) | 예상 남은 시간: ${status.scan_eta_seconds === null ? '계산 중...' : formatDuration(status.scan_eta_seconds)}`;
+                } else {
+                    document.getElementById('time-info').innerText =
+                        `실제 소요 시간: ${formatDuration(status.elapsed_seconds)} | 예상 남은 시간: ${status.eta_seconds === null ? '계산 중...' : formatDuration(status.eta_seconds)}`;
+                }
 
                 // 로그 몰아서 업데이트
                 let consoleBox = document.getElementById('console-log-view');
@@ -605,12 +720,69 @@
                 consoleBox.scrollTop = consoleBox.scrollHeight;
 
                 // 완료 시 자동 다운로드 트리거
+                if (status.stopped) {
+                    document.getElementById('stop-translation-btn').classList.add('hidden');
+                }
                 if (status.complete && pollingInterval) {
                     clearInterval(pollingInterval);
                     pollingInterval = null;
                     triggerAutoDownload(status.b64_data, status.zip_filename);
                 }
             });
+    }
+
+    function formatDuration(seconds) {
+        seconds = Number(seconds || 0);
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const secs = Math.floor(seconds % 60);
+        return [hours, minutes, secs].map(v => String(v).padStart(2, '0')).join(':');
+    }
+
+    function getTranslationLog() {
+        const text = document.getElementById('console-log-view').innerText || '번역 로그가 없습니다.';
+        const status = document.getElementById('status-txt').innerText || '';
+        return `번역 상태: ${status}\n\n${text}`;
+    }
+
+    async function copyTranslationLog() {
+        const button = document.getElementById('copy-log-btn');
+        try {
+            await navigator.clipboard.writeText(getTranslationLog());
+            const original = button.innerText;
+            button.innerText = '✓ 복사됨';
+            setTimeout(() => { button.innerText = original; }, 1500);
+        } catch (err) {
+            alert(`로그 복사 실패: ${err.message}`);
+        }
+    }
+
+    function downloadTranslationLog() {
+        const blob = new Blob([getTranslationLog()], {type: 'text/plain;charset=utf-8'});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `translation-log-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+        link.click();
+        URL.revokeObjectURL(url);
+    }
+
+    function getSessionRequest() {
+        return {src_lang: document.getElementById('src-lang').value, dest_lang: document.getElementById('dest-lang').value, skip_chapters: document.getElementById('skip-chapters').checked, engine_choice: document.querySelector('input[name="engine"]:checked').value, selected_pack_idx: selectedPackIdx, api_key: document.getElementById('input-api-key').value, model_name: document.getElementById('input-model-name').value, endpoint_url: document.getElementById('input-endpoint-url').value};
+    }
+    async function saveTranslationSession() {
+        try { const r = await fetch(`${API_BASE}/api/session/save`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(getSessionRequest())}); if (!r.ok) throw new Error(await r.text()); alert('번역 세션을 저장했습니다.'); } catch (e) { alert(`세션 저장 실패: ${e.message}`); }
+    }
+    async function loadTranslationSession() {
+        try { const r = await fetch(`${API_BASE}/api/session`); const d = await r.json(); if (!d.exists) { alert('저장된 세션이 없습니다.'); return; } const q = d.session.request; document.getElementById('src-lang').value = q.src_lang; document.getElementById('dest-lang').value = q.dest_lang; document.getElementById('skip-chapters').checked = q.skip_chapters; document.getElementById('input-api-key').value = q.api_key || ''; document.getElementById('input-model-name').value = q.model_name || ''; document.getElementById('input-endpoint-url').value = q.endpoint_url || ''; const e = document.querySelector(`input[name="engine"][value="${q.engine_choice}"]`); if (e) e.checked = true; selectedPackIdx = q.selected_pack_idx; toggleEngineFields(); alert('세션을 불러왔습니다. 번역 시작을 누르면 이어서 처리합니다.'); } catch (e) { alert(`세션 불러오기 실패: ${e.message}`); }
+    }
+
+    function stopTranslation() {
+        if (!confirm('현재 번역 작업을 중지하시겠습니까? 저장되지 않은 번역 결과는 폐기됩니다.')) return;
+        document.getElementById('stop-translation-btn').disabled = true;
+        fetch(`${API_BASE}/api/stop-translation`, {method: 'POST'})
+            .then(() => { document.getElementById('status-txt').innerText = '⏹ 중지 요청됨 - 현재 작업 종료 대기 중...'; })
+            .catch(err => { document.getElementById('stop-translation-btn').disabled = false; console.error('중지 요청 실패', err); });
     }
 
     function triggerAutoDownload(base64ZipData, filename) {
@@ -635,9 +807,11 @@
             }).catch(err => console.log("서버 연결 끊김"));
         }, 3000);
 
-        // 사용자가 탭을 닫거나 브라우저를 종료하는 순간 즉시 마지막 신호를 전송 (선택 사항, 더 빠른 종료용)
-        window.addEventListener('beforeunload', () => {
-            navigator.sendBeacon(`${API_BASE}/api/heartbeat`);
+        // 사용자가 탭을 닫거나 브라우저를 종료하는 순간 명시적 종료 신호를 전송
+        // (pagehide는 새로고침/탭 전환 시에도 발생하지만, 백엔드의 유예 시간(20초) 내에
+        //  새 페이지가 하트비트를 다시 보내면 종료가 취소됩니다.)
+        window.addEventListener('pagehide', () => {
+            navigator.sendBeacon(`${API_BASE}/api/browser-close`);
         });
     }
 
