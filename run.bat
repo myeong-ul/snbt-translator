@@ -21,7 +21,7 @@ if defined VENV_PATH (
         %VENV_PATH%\Scripts\pip.exe install -r requirements.txt --quiet
     )
     echo ➔ 가상환경 파이썬으로 프로그램을 실행합니다.
-    %VENV_PATH%\Scripts\python.exe cli_translator.py
+    %VENV_PATH%\Scripts\python.exe main.py
     goto END
 )
 
@@ -42,7 +42,7 @@ if exist requirements.txt (
     pip install -r requirements.txt --quiet
 )
 echo ➔ 시스템 파이썬으로 프로그램을 실행합니다.
-python cli_translator.py
+python main.py
 
 :END
 echo.

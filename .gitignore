@@ -3,3 +3,21 @@
 test_key.env
 input/*
 output/*
+api.env
+api_vault_v3.json
+translation_session.json
+launcher_config.json
+glossary.json
+nllb_server_test.log
+8
+
+# 로컬 NLLB 런타임 생성물
+nllb_config.json
+nllb_server.log
+nllb_server.pid
+models/
+translation_cache.json
+
+# Python 캐시
+__pycache__/
+*.py[cod]
